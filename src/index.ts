@@ -103,7 +103,13 @@ io.on("connection", (socket) => {
 //  }
 // }
 
-httpServer.listen(3000);
+const HOST = "0.0.0.0";
+const PORT = 3000;
+
+httpServer.listen(PORT, HOST, () => {
+  console.log(`Server running on http://${HOST}:${PORT}`);
+  console.log(`Access from other devices using your local IP (port:${PORT})`);
+});
 //  socket.on("location-update",({lat,lng})=>{
 //     if (typeof lat !== "number" || typeof lng !== "number"){
 //      return
