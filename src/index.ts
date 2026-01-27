@@ -18,6 +18,17 @@ io.on("connection", (socket) => {
   // ── Ensure only ONE socket per user ─────────────
   const existingSockets = userSockets.get(userId)
 
+
+    async function getAllSocketIds() {
+    const sockets = await io.fetchSockets();
+    
+    console.log('All connected socket IDs:', sockets);
+    return sockets;
+  }
+
+  // Example usage (e.g., after a new connection)
+  getAllSocketIds();
+
   if (existingSockets) {
     for (const oldSocketId of existingSockets) {
       const oldSocket = io.sockets.sockets.get(oldSocketId)
