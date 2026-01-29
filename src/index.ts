@@ -4,10 +4,27 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import socketAuth from "./middelware/authmiddleware";
 const httpServer = createServer();
-const rooms: Record<
+type Location = {
+  lat: number
+  lng: number
+  ts: number
+}
+ // roomId -> userId -> active session info
+const activeUsersByRoom = new Map<
   string,
-  Record<string, { userId: string; location: any }>
-> = {};
+  Map<number, {
+    sessionId: string
+    sockets: Set<string>
+    location: Location | null
+  }>
+>()
+
+// socketId -> roomId + sessionId
+const activeBySocket = new Map<
+  string,
+  { roomId: string; sessionId: string }
+>()
+
 
 const io = new Server(httpServer, {});
 //authenticate the user
@@ -15,123 +32,95 @@ io.use(socketAuth);
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
   const userId = socket.data.user.id;
-  socket.on("start-session", ({ roomId }, userId) => {
-    socket.join(roomId);
+   socket.on("join-room", (roomId: string) => {
+  if (!roomId) return
 
-    // Init room if not exists
-    if (!rooms[roomId]) {
-      rooms[roomId] = {};
-    }
+  socket.join(`room:${roomId}`)
 
-    rooms[roomId][socket.id] = {
-      userId,
-      location: null,
-    };
+  const roomMap = activeUsersByRoom.get(roomId)
+  const snapshot = roomMap
+    ? Array.from(roomMap.entries())
+        .map(([uid, data]) =>
+          data.location
+            ? { userId: uid, ...data.location }
+            : null
+        )
+        .filter(Boolean)
+    : []
 
-    // Send existing users' locations to the new user
-    socket.emit("room-users", rooms[roomId]);
-
-    console.log(`${socket.id} joined room ${roomId}`);
-  });
-  socket.on("location-update", ({ roomId, lat, lng }) => {
-    // Save location
-    if (!rooms[roomId] || !rooms[roomId][socket.id]) return;
-    rooms[roomId][socket.id]!.location = { lat, lng };
-
-    // Send updated locations to everyone in the room
-    io.to(roomId).emit("location-update", {
-      socketId: socket.id,
-      location: { lat, lng },
-    });
-  });
-socket.on("end-session", () => {
-    socket.disconnect(true);
+  socket.emit("location:snapshot", snapshot)
 })
-  socket.on("disconnect", () => {
-    for (const roomId in rooms) {
-      if (rooms[roomId] && rooms[roomId][socket.id]) {
-        delete rooms[roomId][socket.id];
 
-        // Notify room user left
-        io.to(roomId).emit("user-left", userId);
+  socket.on("start-session", ({ roomId, sessionId }) => {
+  const userId = socket.data.user.id
+  if (!roomId || !sessionId) return
 
-        // Clean empty room
-        if (rooms[roomId] && Object.keys(rooms[roomId]!).length === 0) {
-          delete rooms[roomId];
-        }
-      }
+  if (!activeUsersByRoom.has(roomId)) {
+    activeUsersByRoom.set(roomId, new Map())
+  }
+
+  const roomMap = activeUsersByRoom.get(roomId)!
+
+  if (!roomMap.has(userId)) {
+    roomMap.set(userId, {
+      sessionId,
+      sockets: new Set(),
+      location: null,
+    })
+  }
+
+  roomMap.get(userId)!.sockets.add(socket.id)
+  activeBySocket.set(socket.id, { roomId, sessionId })
+})
+
+socket.on("location:update", ({ lat, lng }) => {
+  const userId = socket.data.user.id
+  const active = activeBySocket.get(socket.id)
+  if (!active) return
+
+  const { roomId } = active
+  const roomMap = activeUsersByRoom.get(roomId)
+  if (!roomMap) return
+
+  const userData = roomMap.get(userId)
+  if (!userData) return
+
+  const point = { lat, lng, ts: Date.now() }
+  userData.location = point
+
+  socket.to(`room:${roomId}`).emit("location:update", {
+    userId,
+    ...point,
+  })
+})
+
+   function cleanupSocket(socketId: string) {
+  const active = activeBySocket.get(socketId)
+  if (!active) return
+
+  const { roomId } = active
+  const roomMap = activeUsersByRoom.get(roomId)
+  const userData = roomMap?.get(userId)
+
+  if (userData) {
+    userData.sockets.delete(socketId)
+
+    if (userData.sockets.size === 0) {
+      roomMap!.delete(userId)
+
+      socket.to(`room:${roomId}`).emit("user:offline", { userId })
     }
+  }
 
-    console.log("User disconnected:", socket.id);
-  });
+  activeBySocket.delete(socketId)
+}
+
+socket.on("end-session", () => cleanupSocket(socket.id))
+socket.on("disconnect", () => cleanupSocket(socket.id))
+
 });
 
-// io.local.socketsJoin("room1");
-// io.on("connection", (socket) => {
-//   const userId = socket.data.user.id
-//   const socketId = socket.id
-
-//   const existingSockets = userSockets.get(userId)
-
-//   if (existingSockets) {
-//     for (const oldSocketId of existingSockets) {
-//       const oldSocket = io.sockets.sockets.get(oldSocketId)
-//       if (oldSocket) {
-//         oldSocket.disconnect(true)
-//       }
-//     }
-//   }
-
-//   // Register ONLY this socket
-//   userSockets.set(userId, new Set([socketId]))
-
-//   console.log(`user ${userId} connected with socket ${socketId}`)
-
-//   // ── Send snapshot of others ────────────────────
-//   const snapshot = Array.from(liveUsers.entries())
-//     .filter(([id]) => id !== userId)
-//     .map(([id, loc]) => ({ userId: id, ...loc }))
-
-//   socket.emit("location:snapshot", snapshot)
-
-//   // ── Handle location updates ────────────────────
-//   socket.on("location:update", ({ lat, lng }) => {
-//     if (
-//       typeof lat !== "number" ||
-//       typeof lng !== "number" ||
-//       lat < -90 ||
-//       lat > 90 ||
-//       lng < -180 ||
-//       lng > 180
-//     ) return
-
-//     const point = { lat, lng, ts: Date.now() }
-//     liveUsers.set(userId, point)
-
-//     socket.broadcast.emit("location:update", {
-//       userId,
-//       ...point,
-//     })
-//   })
-//     socket.on("session-end",()=>{
-//       socket.disconnect(true)
-//     })
-//   socket.on("disconnect", () => {
-//     const sockets = userSockets.get(userId)
-
-//     if (sockets && sockets.has(socketId)) {
-//       sockets.delete(socketId)
-//       if (sockets.size === 0) {
-//         userSockets.delete(userId)
-//         liveUsers.delete(userId)
-
-//         socket.broadcast.emit("user:offline", { userId })
-//         console.log(`user ${userId} disconnected`)
-//       }
-//     }
-//   })
-
-// });
+ 
 
 const HOST = "0.0.0.0";
 const PORT = 3000;
