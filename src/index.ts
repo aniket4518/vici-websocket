@@ -3,17 +3,19 @@ dotenv.config();
 import { createServer } from "http";
 import { Server } from "socket.io";
 import socketAuth from "./middelware/authmiddleware";
+import { redis } from "./redis/redis";
 const httpServer = createServer();
 type Location = {
   lat: number
   lng: number
   ts: number
 }
- // roomId -> userId -> active session info
+
+ 
 const activeUsersByRoom = new Map<
   string,
   Map<number, {
-    sessionId: string
+    sessionId: number
     sockets: Set<string>
     location: Location | null
   }>
@@ -22,7 +24,7 @@ const activeUsersByRoom = new Map<
 // socketId -> roomId + sessionId
 const activeBySocket = new Map<
   string,
-  { roomId: string; sessionId: string }
+  { roomId: string; sessionId: number }
 >()
 
 
@@ -73,12 +75,11 @@ io.on("connection", (socket) => {
   activeBySocket.set(socket.id, { roomId, sessionId })
 })
 
-socket.on("location:update", ({ lat, lng }) => {
+socket.on("location:update", async ({ lat, lng }) => {
   const userId = socket.data.user.id
   const active = activeBySocket.get(socket.id)
   if (!active) return
-
-  const { roomId } = active
+  const { roomId, sessionId } = active
   const roomMap = activeUsersByRoom.get(roomId)
   if (!roomMap) return
 
@@ -87,6 +88,12 @@ socket.on("location:update", ({ lat, lng }) => {
 
   const point = { lat, lng, ts: Date.now() }
   userData.location = point
+          await redis
+        .multi()
+        .rpush(`session:${sessionId}:path`, JSON.stringify(point))
+        .expire(`session:${sessionId}:path`, 60 * 60 * 6) 
+        .exec()
+
 
   socket.to(`room:${roomId}`).emit("location:update", {
     userId,

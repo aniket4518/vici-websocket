@@ -13,9 +13,10 @@
   "author": "",
   "license": "ISC",
   "packageManager": "pnpm@10.28.1",
-  "dependencies": {
+  "dependencies": { 
     "@types/jsonwebtoken": "^9.0.10",
     "dotenv": "^17.2.3",
+    "ioredis": "^5.9.2",
     "jsonwebtoken": "^9.0.3",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3"
