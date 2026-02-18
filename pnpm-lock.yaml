@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@types/ioredis':
-        specifier: ^5.0.0
-        version: 5.0.0
       '@types/jsonwebtoken':
         specifier: ^9.0.10
         version: 9.0.10
@@ -76,10 +73,6 @@ packages:
 
   '@types/cors@2.8.19':
     resolution: {integrity: sha512-mFNylyeyqN93lfe/9CSxOGREz8cpzAhH+E93xJ4xWQf62V8sQ/24reV2nyzUWM6H6Xji+GGHpkbLe7pVoUEskg==}
-
-  '@types/ioredis@5.0.0':
-    resolution: {integrity: sha512-zJbJ3FVE17CNl5KXzdeSPtdltc4tMT3TzC6fxQS0sQngkbFZ6h+0uTafsRqu+eSLIugf6Yb0Ea0SUuRr42Nk9g==}
-    deprecated: This is a stub types definition. ioredis provides its own type definitions, so you do not need this installed.
 
   '@types/jsonwebtoken@9.0.10':
     resolution: {integrity: sha512-asx5hIG9Qmf/1oStypjanR7iKTv0gXQ1Ov/jfrX6kS/EO0OFni8orbmGCn0672NHR3kXHwpAwR+B368ZGN/2rA==}
@@ -339,12 +332,6 @@ snapshots:
   '@types/cors@2.8.19':
     dependencies:
       '@types/node': 25.0.10
-
-  '@types/ioredis@5.0.0':
-    dependencies:
-      ioredis: 5.9.2
-    transitivePeerDependencies:
-      - supports-color
 
   '@types/jsonwebtoken@9.0.10':
     dependencies:
