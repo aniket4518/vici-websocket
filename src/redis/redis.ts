@@ -21,7 +21,7 @@ const sharedOptions: Partial<RedisOptions> = {
     const targetErrors = ["READONLY", "ECONNRESET", "ETIMEDOUT"];
     return targetErrors.some((e) => err.message.includes(e));
   },
-  // Enable TLS if using rediss:// protocol
+   
   ...(REDIS_URL?.startsWith("rediss://") && {
     tls: { rejectUnauthorized: false },
   }),
