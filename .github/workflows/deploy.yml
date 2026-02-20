@@ -39,19 +39,17 @@ jobs:
     runs-on: self-hosted
     steps:
       - name: Pull image from docker hub
-        run: docker pull aniketjha4518/vicisocket:latest
+        run: sudo docker pull aniketjha4518/vicisocket:latest
 
-      - name: Stop and remove old container
-        run: |
-          docker stop vicisocket-container || true
-          docker rm vicisocket-container || true
+      - name: Force remove old container if exists
+        run: sudo docker rm -f vicisocket-container || true
 
-      - name: Run docker container
+      - name: Start new container
         run: |
-          docker run -d \
-            -p 3000:3000 \
+          sudo docker run -d \
             --name vicisocket-container \
             --restart unless-stopped \
+            -p 3000:3000 \
             -e JWT_SECRET="${{ secrets.JWT_SECRET }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             aniketjha4518/vicisocket:latest
