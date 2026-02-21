@@ -4,7 +4,10 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import socketAuth from "./middelware/authmiddleware";
 import { redis } from "./redis/redis";
-const httpServer = createServer();
+const httpServer = createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Socket server is running");
+});
 type Location = {
   lat: number
   lng: number
