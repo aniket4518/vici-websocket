@@ -1,136 +1,278 @@
 import dotenv from "dotenv";
-dotenv.config();
 import { createServer } from "http";
-import { Server } from "socket.io";
+import { Server, type Socket } from "socket.io";
 import socketAuth from "./middelware/authmiddleware";
 import { redis } from "./redis/redis";
+
+dotenv.config();
+
 const httpServer = createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Socket server is running");
 });
+
 type Location = {
-  lat: number
-  lng: number
-  ts: number
-}
+  lat: number;
+  lng: number;
+  ts: number;
+};
 
- 
-const activeUsersByRoom = new Map<
-  string,
-  Map<number, {
-    sessionId: number
-    sockets: Set<string>
-    location: Location | null
-  }>
->()
+type ActiveUserSession = {
+  sessionId: number;
+  sockets: Set<string>;
+  location: Location | null;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  disconnectedAt: number | null;
+};
 
-// socketId -> roomId + sessionId
+const SESSION_RESUME_WINDOW_MS = Number(
+  process.env.SESSION_RESUME_WINDOW_MS ?? 30_000,
+);
+
+const activeUsersByRoom = new Map<string, Map<number, ActiveUserSession>>();
 const activeBySocket = new Map<
   string,
-  { roomId: string; sessionId: number }
->()
+  { roomId: string; userId: number; sessionId: number }
+>();
 
-
-const io = new Server(httpServer, {});
-//authenticate the user
-io.use(socketAuth);
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-  const userId = socket.data.user.id;
-   socket.on("join-room", (roomId: string) => {
-  if (!roomId) return
-
-  socket.join(`room:${roomId}`)
-
-  const roomMap = activeUsersByRoom.get(roomId)
-  const snapshot = roomMap
-    ? Array.from(roomMap.entries())
-        .map(([uid, data]) =>
-          data.location
-            ? { userId: uid, ...data.location }
-            : null
-        )
-        .filter(Boolean)
-    : []
-
-  socket.emit("location:snapshot", snapshot)
-})
-
-  socket.on("start-session", ({ roomId, sessionId }) => {
-  const userId = socket.data.user.id
-  if (!roomId || !sessionId) return
-
+function getOrCreateRoomMap(roomId: string) {
   if (!activeUsersByRoom.has(roomId)) {
-    activeUsersByRoom.set(roomId, new Map())
+    activeUsersByRoom.set(roomId, new Map());
+  }
+  return activeUsersByRoom.get(roomId)!;
+}
+
+function clearReconnectTimer(userData: ActiveUserSession) {
+  if (userData.reconnectTimer) {
+    clearTimeout(userData.reconnectTimer);
+    userData.reconnectTimer = null;
+  }
+}
+
+function scheduleSessionCleanup(
+  roomId: string,
+  userId: number,
+  userData: ActiveUserSession,
+) {
+  clearReconnectTimer(userData);
+  userData.disconnectedAt = Date.now();
+  userData.reconnectTimer = setTimeout(() => {
+    finalizeSession(roomId, userId);
+  }, SESSION_RESUME_WINDOW_MS);
+}
+
+function finalizeSession(roomId: string, userId: number) {
+  const roomMap = activeUsersByRoom.get(roomId);
+  const userData = roomMap?.get(userId);
+  if (!roomMap || !userData) return;
+
+  clearReconnectTimer(userData);
+
+  for (const socketId of userData.sockets) {
+    activeBySocket.delete(socketId);
+    io.sockets.sockets.get(socketId)?.leave(`room:${roomId}`);
   }
 
-  const roomMap = activeUsersByRoom.get(roomId)!
-
-  if (!roomMap.has(userId)) {
-    roomMap.set(userId, {
-      sessionId,
-      sockets: new Set(),
-      location: null,
-    })
+  roomMap.delete(userId);
+  if (roomMap.size === 0) {
+    activeUsersByRoom.delete(roomId);
   }
 
-  roomMap.get(userId)!.sockets.add(socket.id)
-  activeBySocket.set(socket.id, { roomId, sessionId })
-})
+  io.to(`room:${roomId}`).emit("user:offline", { userId });
+}
 
-socket.on("location:update", async ({ lat, lng }) => {
-  const userId = socket.data.user.id
-  const active = activeBySocket.get(socket.id)
-  if (!active) return
-  const { roomId, sessionId } = active
-  const roomMap = activeUsersByRoom.get(roomId)
-  if (!roomMap) return
+function detachSocket(socketId: string) {
+  const active = activeBySocket.get(socketId);
+  if (!active) return;
 
-  const userData = roomMap.get(userId)
-  if (!userData) return
-
-  const point = { lat, lng, ts: Date.now() }
-  userData.location = point
-          await redis
-        .multi()
-        .rpush(`session:${sessionId}:path`, JSON.stringify(point))
-        .expire(`session:${sessionId}:path`, 60 * 60 * 6) 
-        .exec()
-
-
-  socket.to(`room:${roomId}`).emit("location:update", {
-    userId,
-    ...point,
-  })
-})
-
-   function cleanupSocket(socketId: string) {
-  const active = activeBySocket.get(socketId)
-  if (!active) return
-
-  const { roomId } = active
-  const roomMap = activeUsersByRoom.get(roomId)
-  const userData = roomMap?.get(userId)
+  const roomMap = activeUsersByRoom.get(active.roomId);
+  const userData = roomMap?.get(active.userId);
 
   if (userData) {
-    userData.sockets.delete(socketId)
-
+    userData.sockets.delete(socketId);
     if (userData.sockets.size === 0) {
-      roomMap!.delete(userId)
-
-      socket.to(`room:${roomId}`).emit("user:offline", { userId })
+      scheduleSessionCleanup(active.roomId, active.userId, userData);
     }
   }
 
-  activeBySocket.delete(socketId)
+  activeBySocket.delete(socketId);
 }
 
-socket.on("end-session", () => cleanupSocket(socket.id))
-socket.on("disconnect", () => cleanupSocket(socket.id))
+function attachSocketToSession(
+  socket: Socket,
+  roomId: string,
+  userId: number,
+  sessionId: number,
+) {
+  const previous = activeBySocket.get(socket.id);
+  if (previous) {
+    const previousRoomMap = activeUsersByRoom.get(previous.roomId);
+    const previousUserData = previousRoomMap?.get(previous.userId);
 
+    if (previousUserData) {
+      previousUserData.sockets.delete(socket.id);
+      if (previousUserData.sockets.size === 0) {
+        scheduleSessionCleanup(
+          previous.roomId,
+          previous.userId,
+          previousUserData,
+        );
+      }
+    }
+
+    activeBySocket.delete(socket.id);
+  }
+
+  const roomMap = getOrCreateRoomMap(roomId);
+  const userData = roomMap.get(userId) ?? {
+    sessionId,
+    sockets: new Set<string>(),
+    location: null,
+    reconnectTimer: null,
+    disconnectedAt: null,
+  };
+
+  clearReconnectTimer(userData);
+  userData.sessionId = sessionId;
+  userData.disconnectedAt = null;
+  userData.sockets.add(socket.id);
+  roomMap.set(userId, userData);
+
+  socket.join(`room:${roomId}`);
+  activeBySocket.set(socket.id, { roomId, userId, sessionId });
+}
+
+function getActiveUserSession(roomId: string, userId: number) {
+  return activeUsersByRoom.get(roomId)?.get(userId) ?? null;
+}
+
+async function saveLastLocationToRedis(
+  sessionId: number,
+  userId: number,
+  point: Location,
+) {
+  await redis
+    .multi()
+    .set(
+      `session:${sessionId}:user:${userId}:last-location`,
+      JSON.stringify(point),
+      "EX",
+      60 * 60 * 6,
+    )
+    .exec();
+}
+
+const io = new Server(httpServer, {});
+io.use(socketAuth);
+
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+
+  const userId = socket.data.user?.id;
+  if (!userId) {
+    socket.disconnect(true);
+    return;
+  }
+
+  socket.on("join-room", (roomId: string) => {
+    if (!roomId) return;
+
+    socket.join(`room:${roomId}`);
+
+    const roomMap = activeUsersByRoom.get(roomId);
+    const snapshot = roomMap
+      ? Array.from(roomMap.entries())
+          .map(([uid, data]) =>
+            data.location ? { userId: uid, ...data.location } : null,
+          )
+          .filter(Boolean)
+      : [];
+
+    socket.emit("location:snapshot", snapshot);
+  });
+
+  socket.on("start-session", ({ roomId, sessionId }) => {
+    if (!roomId || !sessionId) return;
+    attachSocketToSession(socket, roomId, userId, Number(sessionId));
+  });
+
+  // Frontend reconnect event: verify user is still active in room, then rebind socket and restore location state.
+  socket.on("reconnect-session", async ({ roomId, sessionId }) => {
+    if (!roomId) {
+      socket.emit("session:resume-failed", { reason: "room-missing" });
+      return;
+    }
+
+    const userData = getActiveUserSession(roomId, userId);
+    if (!userData) {
+      socket.emit("session:resume-failed", { reason: "not-active" });
+      return;
+    }
+
+    if (sessionId && Number(sessionId) !== userData.sessionId) {
+      socket.emit("session:resume-failed", { reason: "session-mismatch" });
+      return;
+    }
+
+    attachSocketToSession(socket, roomId, userId, userData.sessionId);
+
+    if (userData.location) {
+      await saveLastLocationToRedis(
+        userData.sessionId,
+        userId,
+        userData.location,
+      );
+    }
+
+    socket.emit("session:resumed", {
+      roomId,
+      sessionId: userData.sessionId,
+      location: userData.location,
+      disconnectedAt: userData.disconnectedAt,
+    });
+  });
+
+  socket.on("location:update", async ({ lat, lng }) => {
+    const active = activeBySocket.get(socket.id);
+    if (!active) return;
+
+    const roomMap = activeUsersByRoom.get(active.roomId);
+    if (!roomMap) return;
+
+    const userData = roomMap.get(active.userId);
+    if (!userData) return;
+
+    const point: Location = { lat, lng, ts: Date.now() };
+    userData.location = point;
+
+    await redis
+      .multi()
+      .rpush(`session:${active.sessionId}:path`, JSON.stringify(point))
+      .expire(`session:${active.sessionId}:path`, 60 * 60 * 6)
+      .set(
+        `session:${active.sessionId}:user:${active.userId}:last-location`,
+        JSON.stringify(point),
+        "EX",
+        60 * 60 * 6,
+      )
+      .exec();
+
+    socket.to(`room:${active.roomId}`).emit("location:update", {
+      userId: active.userId,
+      ...point,
+    });
+  });
+
+  socket.on("end-session", () => {
+    const active = activeBySocket.get(socket.id);
+    if (!active) return;
+    finalizeSession(active.roomId, active.userId);
+  });
+
+  socket.on("disconnect", () => {
+    detachSocket(socket.id);
+  });
 });
-
- 
 
 const HOST = "0.0.0.0";
 const PORT = 3000;
