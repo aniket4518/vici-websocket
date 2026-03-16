@@ -26,8 +26,10 @@ type ActiveUserSession = {
 };
 
 const SESSION_RESUME_WINDOW_MS = Number(
-  process.env.SESSION_RESUME_WINDOW_MS ?? 30_000,
+  process.env.SESSION_RESUME_WINDOW_MS ?? 172_800_000, // 48 hours
 );
+
+const REDIS_TTL_SECONDS = 60 * 60 * 48; // 48 hours
 
 const activeUsersByRoom = new Map<string, Map<number, ActiveUserSession>>();
 const activeBySocket = new Map<
@@ -157,7 +159,7 @@ async function saveLastLocationToRedis(
       `session:${sessionId}:user:${userId}:last-location`,
       JSON.stringify(point),
       "EX",
-      60 * 60 * 6,
+      REDIS_TTL_SECONDS,
     )
     .exec();
 }
@@ -182,10 +184,10 @@ io.on("connection", (socket) => {
     const roomMap = activeUsersByRoom.get(roomId);
     const snapshot = roomMap
       ? Array.from(roomMap.entries())
-          .map(([uid, data]) =>
-            data.location ? { userId: uid, ...data.location } : null,
-          )
-          .filter(Boolean)
+        .map(([uid, data]) =>
+          data.location ? { userId: uid, ...data.location } : null,
+        )
+        .filter(Boolean)
       : [];
 
     socket.emit("location:snapshot", snapshot);
@@ -232,6 +234,59 @@ io.on("connection", (socket) => {
     });
   });
 
+  // Frontend sends buffered locations collected while disconnected
+  socket.on(
+    "location:sync-buffered",
+    async ({ locations }: { locations: Array<{ lat: number; lng: number; ts: number }> }) => {
+      const active = activeBySocket.get(socket.id);
+      if (!active) return;
+
+      if (!Array.isArray(locations) || locations.length === 0) return;
+
+      const roomMap = activeUsersByRoom.get(active.roomId);
+      if (!roomMap) return;
+
+      const userData = roomMap.get(active.userId);
+      if (!userData) return;
+
+      // Pipeline all buffered points into Redis in one go
+      const pipeline = redis.multi();
+      for (const loc of locations) {
+        const point: Location = { lat: loc.lat, lng: loc.lng, ts: loc.ts };
+        pipeline.rpush(`session:${active.sessionId}:path`, JSON.stringify(point));
+      }
+      pipeline.expire(`session:${active.sessionId}:path`, REDIS_TTL_SECONDS);
+
+      // Update last-location with the final buffered point
+      const lastPoint = locations[locations.length - 1]!;
+      const lastLocation: Location = {
+        lat: lastPoint.lat,
+        lng: lastPoint.lng,
+        ts: lastPoint.ts,
+      };
+      pipeline.set(
+        `session:${active.sessionId}:user:${active.userId}:last-location`,
+        JSON.stringify(lastLocation),
+        "EX",
+        REDIS_TTL_SECONDS,
+      );
+
+      await pipeline.exec();
+
+      // Update in-memory state
+      userData.location = lastLocation;
+
+      // Acknowledge to the sender
+      socket.emit("location:sync-ack", { count: locations.length });
+
+      // Broadcast the latest position to other users in the room
+      socket.to(`room:${active.roomId}`).emit("location:update", {
+        userId: active.userId,
+        ...lastLocation,
+      });
+    },
+  );
+
   socket.on("location:update", async ({ lat, lng }) => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
@@ -248,12 +303,12 @@ io.on("connection", (socket) => {
     await redis
       .multi()
       .rpush(`session:${active.sessionId}:path`, JSON.stringify(point))
-      .expire(`session:${active.sessionId}:path`, 60 * 60 * 6)
+      .expire(`session:${active.sessionId}:path`, REDIS_TTL_SECONDS)
       .set(
         `session:${active.sessionId}:user:${active.userId}:last-location`,
         JSON.stringify(point),
         "EX",
-        60 * 60 * 6,
+        REDIS_TTL_SECONDS,
       )
       .exec();
 

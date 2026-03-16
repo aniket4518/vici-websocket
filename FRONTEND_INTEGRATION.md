@@ -57,7 +57,7 @@ This WebSocket server (built with **Socket.IO**) enables real-time location shar
 |----------|----------|---------|-------------|
 | `JWT_SECRET` | ✅ Yes | — | Secret key used to verify JWT tokens |
 | `REDIS_URL` | ❌ No | `localhost:6379` | Redis connection URL (supports `redis://` and `rediss://` for TLS) |
-| `SESSION_RESUME_WINDOW_MS` | ❌ No | `30000` (30s) | Time (in ms) a disconnected session stays alive before cleanup |
+| `SESSION_RESUME_WINDOW_MS` | ❌ No | `172800000` (48h) | Time (in ms) a disconnected session stays alive before cleanup |
 
 **.env.example:**
 
@@ -308,7 +308,7 @@ socket.emit("end-session");
 
 ### 5. `reconnect-session`
 
-Attempt to resume a previously active session after a disconnection. This must be called within the **reconnect grace period** (`SESSION_RESUME_WINDOW_MS`, default 30s).
+Attempt to resume a previously active session after a disconnection. This must be called within the **reconnect grace period** (`SESSION_RESUME_WINDOW_MS`, default 48 hours).
 
 **Emit:**
 
@@ -341,6 +341,43 @@ socket.emit("reconnect-session", {
 | ❌ `roomId` missing | `session:resume-failed` | `{ reason: "room-missing" }` |
 | ❌ No active session found | `session:resume-failed` | `{ reason: "not-active" }` |
 | ❌ `sessionId` doesn't match | `session:resume-failed` | `{ reason: "session-mismatch" }` |
+
+---
+
+### 6. `location:sync-buffered`
+
+Send buffered location points that were collected while the socket was disconnected. **Must be called after a successful `reconnect-session`** — the socket needs an active session.
+
+**Emit:**
+
+```typescript
+socket.emit("location:sync-buffered", {
+  locations: [
+    { lat: 40.785091, lng: -73.968285, ts: 1706636270000 },
+    { lat: 40.785120, lng: -73.968300, ts: 1706636272000 },
+    { lat: 40.785150, lng: -73.968320, ts: 1706636274000 }
+  ]
+});
+```
+
+| Parameter   | Type                                    | Required | Description                                       |
+|-------------|-----------------------------------------|----------|---------------------------------------------------|
+| `locations` | `Array<{ lat, lng, ts }>` | ✅       | Buffered location points with client-side timestamps |
+
+**What happens internally:**
+1. Validates the socket has an active session.
+2. Validates `locations` is a non-empty array.
+3. Uses a single Redis pipeline to `RPUSH` all points into `session:{sessionId}:path`.
+4. Updates `last-location` key with the **last** point.
+5. Updates in-memory location state.
+6. Emits `location:sync-ack` back with `{ count }` to confirm receipt.
+7. Broadcasts the latest position to the room.
+
+> ⚠️ Buffered points use the **frontend's `ts`** (historical timestamps), unlike `location:update` which uses server-side `Date.now()`.
+
+**Server Response:** Emits `location:sync-ack` with `{ count: number }`.
+
+**Error Handling:** Silently ignored if the socket is not in an active session or `locations` is empty.
 
 ---
 
@@ -527,22 +564,24 @@ interface SessionResumeFailed {
 | `location:update` | Client → Server | `{ lat, lng }` | `location:update` → room (others) | During active session, share GPS location |
 | `end-session` | Client → Server | *none* | `user:offline` → room (others) | When user ends running session |
 | `reconnect-session` | Client → Server | `{ roomId, sessionId? }` | `session:resumed` or `session:resume-failed` → caller | After reconnecting, resume a session |
+| `location:sync-buffered` | Client → Server | `{ locations: [{ lat, lng, ts }, ...] }` | `location:sync-ack` → caller | After reconnect, send buffered locations |
 | `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts }, ...]` | Sent after `join-room` |
 | `location:update` | Server → Client | — | `{ userId, lat, lng, ts }` | Real-time location from other users |
 | `user:offline` | Server → Client | — | `{ userId }` | When another user ends/disconnects |
 | `session:resumed` | Server → Client | — | `{ roomId, sessionId, location, disconnectedAt }` | Successful session reconnection |
 | `session:resume-failed` | Server → Client | — | `{ reason }` | Failed session reconnection |
+| `location:sync-ack` | Server → Client | — | `{ count }` | Confirmation of buffered sync |
 
 ---
 
 ## 🗄️ Redis Data Model
 
-All location data is persisted in Redis with a **6-hour TTL**.
+All location data is persisted in Redis with a **48-hour TTL**.
 
 | Key Pattern | Type | TTL | Description |
 |-------------|------|-----|-------------|
-| `session:{sessionId}:path` | List (`RPUSH`) | 6 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":...}` |
-| `session:{sessionId}:user:{userId}:last-location` | String (`SET`) | 6 hours | The **last known** location for a user in a session. JSON string: `{"lat":..., "lng":..., "ts":...}` |
+| `session:{sessionId}:path` | List (`RPUSH`) | 48 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":...}` |
+| `session:{sessionId}:user:{userId}:last-location` | String (`SET`) | 48 hours | The **last known** location for a user in a session. JSON string: `{"lat":..., "lng":..., "ts":...}` |
 
 ### Example Redis Entries
 
@@ -767,6 +806,20 @@ interface SessionResumedPayload {
 interface SessionResumeFailedPayload {
   reason: "room-missing" | "not-active" | "session-mismatch";
 }
+
+// location:sync-buffered
+interface SyncBufferedPayload {
+  locations: Array<{
+    lat: number;
+    lng: number;
+    ts: number;  // Client-side timestamp (ms)
+  }>;
+}
+
+// location:sync-ack
+interface SyncAckPayload {
+  count: number;
+}
 ```
 
 ---
@@ -846,6 +899,13 @@ class ViciSocketService {
     });
   }
 
+  // ── Buffered Sync ──────────────────────────────────
+
+  syncBufferedLocations(locations: Array<{ lat: number; lng: number; ts: number }>): void {
+    if (locations.length === 0) return;
+    this.socket?.emit("location:sync-buffered", { locations });
+  }
+
   // ── Cleanup ─────────────────────────────────────────
 
   disconnect(): void {
@@ -883,6 +943,13 @@ class ViciSocketService {
       console.log("Session resumed:", data);
       // data: { roomId, sessionId, location, disconnectedAt }
       // → Restore state and continue tracking
+      // → Send buffered locations if any
+    });
+
+    // Buffered locations synced successfully
+    this.socket.on("location:sync-ack", (data) => {
+      console.log(`Synced ${data.count} buffered points`);
+      // → Clear local buffer, resume normal location:update
     });
 
     // Session resume failed
@@ -928,7 +995,7 @@ async function main() {
 
 1. **Order Matters** — Always `join-room` before `start-session`
 2. **Local Path Storage** — Store your own location updates locally for path rendering. The server stores them in Redis but doesn't send them back to you.
-3. **Reconnect Grace Period** — After disconnect, the session stays alive for 30 seconds (configurable via `SESSION_RESUME_WINDOW_MS`). Use `reconnect-session` within this window.
+3. **Reconnect Grace Period** — After disconnect, the session stays alive for **48 hours** (configurable via `SESSION_RESUME_WINDOW_MS`). Use `reconnect-session` within this window.
 4. **Session ID** — Must be obtained from your Express/REST backend before starting a session.
 5. **Multi-Device Support** — The same user can connect from multiple devices/sockets. All sockets are tracked per user per room.
 6. **Auto-Cleanup** — If all of a user's sockets disconnect and the grace period expires, `user:offline` is broadcast automatically.
@@ -947,6 +1014,6 @@ async function main() {
 | **Default Port** | `3000` |
 | **Bind Address** | `0.0.0.0` (all interfaces) |
 | **Authentication** | JWT via handshake `auth` or `headers` |
-| **Data Persistence** | Redis (TTL: 6 hours) |
-| **Reconnect Grace Period** | 30 seconds (configurable) |
+| **Data Persistence** | Redis (TTL: 48 hours) |
+| **Reconnect Grace Period** | 48 hours (configurable) |
 | **HTTP Health Check** | `GET /` → `200 OK "Socket server is running"` |
