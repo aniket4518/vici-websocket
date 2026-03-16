@@ -249,9 +249,17 @@ io.on("connection", (socket) => {
       const userData = roomMap.get(active.userId);
       if (!userData) return;
 
-      // Pipeline all buffered points into Redis in one go
+      // Filter out locations the server already has (deduplicate by timestamp)
+      const lastKnownTs = userData.location?.ts ?? 0;
+      const newLocations = locations.filter((loc) => loc.ts > lastKnownTs);
+      if (newLocations.length === 0) {
+        socket.emit("location:sync-ack", { count: 0 });
+        return;
+      }
+
+      // Pipeline all NEW buffered points into Redis in one go
       const pipeline = redis.multi();
-      for (const loc of locations) {
+      for (const loc of newLocations) {
         const point: Location = { lat: loc.lat, lng: loc.lng, ts: loc.ts };
         pipeline.rpush(`session:${active.sessionId}:path`, JSON.stringify(point));
       }
@@ -277,7 +285,7 @@ io.on("connection", (socket) => {
       userData.location = lastLocation;
 
       // Acknowledge to the sender
-      socket.emit("location:sync-ack", { count: locations.length });
+      socket.emit("location:sync-ack", { count: newLocations.length });
 
       // Broadcast the latest position to other users in the room
       socket.to(`room:${active.roomId}`).emit("location:update", {

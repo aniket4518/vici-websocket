@@ -27,11 +27,12 @@ socket.emit("location:sync-buffered", {
 **Server behavior:**
 1. Validates the socket has an active session
 2. Validates `locations` is a non-empty array
-3. Uses a single Redis pipeline to `RPUSH` all points into `session:{sessionId}:path`
-4. Updates `last-location` key with the final point
-5. Updates in-memory location state
-6. Emits `location:sync-ack` back to the caller
-7. Broadcasts the latest position to the room
+3. **Deduplicates** — filters out any points with `ts <= lastKnownTimestamp` (locations the server already received before the disconnect)
+4. Uses a single Redis pipeline to `RPUSH` only the new points into `session:{sessionId}:path`
+5. Updates `last-location` key with the final point
+6. Updates in-memory location state
+7. Emits `location:sync-ack` with `{ count }` — the number of **new** points actually stored (may be less than what was sent)
+8. Broadcasts the latest position to the room
 
 > ⚠️ Buffered points use the **frontend's `ts`** (historical timestamps), unlike normal `location:update` which uses server-side `Date.now()`.
 
