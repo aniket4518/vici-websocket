@@ -1,5 +1,42 @@
 # Changelog
 
+## [2026-03-17] — Fix Ghost Locations & Immediate Offline/Online Events
+
+### 🐛 Bug Fix
+
+#### Disconnected users appearing in `location:snapshot`
+
+Users who disconnected (but were within the 48-hour reconnect window) were still included in the `location:snapshot` sent to newly joining users. This caused the frontend to show "ghost" markers for users who were no longer actively connected.
+
+**Fix:** The snapshot now filters to only include users with `sockets.size > 0` and `disconnectedAt === null` (i.e., currently connected users).
+
+### 🔧 Changes
+
+#### `user:offline` now fires immediately on disconnect
+
+Previously, `user:offline` was only broadcast when the 48-hour reconnect timer expired or when a user explicitly ended their session. Now it is broadcast **immediately** when a user's last socket disconnects, so the frontend can remove the marker right away.
+
+The session data still stays alive for the 48h reconnect window — only the visibility to other users changes.
+
+#### New `user:online` event on reconnect
+
+When a disconnected user reconnects within the grace period, `user:online` is broadcast to the room with their last known location:
+
+```typescript
+socket.on("user:online", (data) => {
+  // data: { userId, lat, lng, ts }
+  // → Re-add user marker on the map
+});
+```
+
+### 📱 Frontend Action Required
+
+1. **Listen for `user:offline`** — When received, **remove** that user's marker from the map immediately
+2. **Listen for `user:online`** — When received, **re-add** that user's marker on the map at the given location
+3. The `location:snapshot` (from `join-room`) now only contains currently connected users, so no frontend changes needed for that
+
+---
+
 ## [2026-03-16] — Buffered Location Sync & Extended Reconnect Window
 
 ### ✨ New Features

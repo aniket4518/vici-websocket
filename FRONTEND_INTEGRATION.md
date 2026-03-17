@@ -386,7 +386,7 @@ socket.emit("location:sync-buffered", {
 
 ### 1. `location:snapshot`
 
-Received **immediately after** emitting `join-room`. Contains all currently active users in the room with their last known location.
+Received **immediately after** emitting `join-room`. Contains only **currently connected** users in the room with their last known location. Users who disconnected (even if within the reconnect window) are **excluded**.
 
 **Listen:**
 
@@ -418,6 +418,8 @@ type LocationSnapshot = Array<{
 ```
 
 > 💡 Users who have an active session but haven't sent any location update yet are **excluded** from the snapshot (their `location` is `null`).
+
+> 💡 Users who are disconnected (within the 48h reconnect window but not currently connected) are **excluded** from the snapshot.
 
 > 💡 If no users are active in the room, an **empty array** `[]` is returned.
 
@@ -456,13 +458,15 @@ interface LocationUpdate {
 
 ### 3. `user:offline`
 
-Received when a user **ends their session** or **all their sockets disconnect** (after the reconnect grace period expires).
+Received **immediately** when a user's **last socket disconnects** or when a user **ends their session**. The frontend should remove the user's marker from the map right away.
+
+> ⚠️ **Changed behavior:** Previously, `user:offline` was only sent after the reconnect grace period expired. Now it is sent **immediately** on disconnect so the frontend does not show stale locations.
 
 **Listen:**
 
 ```typescript
 socket.on("user:offline", (data) => {
-  // Remove user marker from the map
+  // Remove user marker from the map immediately
 });
 ```
 
@@ -482,7 +486,38 @@ interface UserOffline {
 
 ---
 
-### 4. `session:resumed`
+### 4. `user:online`
+
+Received when a user **reconnects** after being offline (their session was in the disconnected/grace period state and they re-attached a socket). The frontend should re-add the user's marker on the map.
+
+**Listen:**
+
+```typescript
+socket.on("user:online", (data) => {
+  // Re-add user marker on the map
+});
+```
+
+**Payload:**
+
+```typescript
+interface UserOnline {
+  userId: number;
+  lat: number;
+  lng: number;
+  ts: number;      // Unix timestamp (milliseconds)
+}
+```
+
+**Example Response:**
+
+```json
+{ "userId": 5, "lat": 40.785091, "lng": -73.968285, "ts": 1706636290000 }
+```
+
+---
+
+### 5. `session:resumed`
 
 Received after a **successful** `reconnect-session` request. Contains the restored session state.
 
@@ -522,7 +557,7 @@ interface SessionResumed {
 
 ---
 
-### 5. `session:resume-failed`
+### 6. `session:resume-failed`
 
 Received when a `reconnect-session` request **fails**.
 
@@ -566,9 +601,10 @@ interface SessionResumeFailed {
 | `end-session` | Client → Server | *none* | `user:offline` → room (others) | When user ends running session |
 | `reconnect-session` | Client → Server | `{ roomId, sessionId? }` | `session:resumed` or `session:resume-failed` → caller | After reconnecting, resume a session |
 | `location:sync-buffered` | Client → Server | `{ locations: [{ lat, lng, ts }, ...] }` | `location:sync-ack` → caller | After reconnect, send buffered locations |
-| `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts }, ...]` | Sent after `join-room` |
+| `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts }, ...]` | Sent after `join-room` (only connected users) |
 | `location:update` | Server → Client | — | `{ userId, lat, lng, ts }` | Real-time location from other users |
-| `user:offline` | Server → Client | — | `{ userId }` | When another user ends/disconnects |
+| `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects or ends session |
+| `user:online` | Server → Client | — | `{ userId, lat, lng, ts }` | When a disconnected user reconnects |
 | `session:resumed` | Server → Client | — | `{ roomId, sessionId, location, disconnectedAt }` | Successful session reconnection |
 | `session:resume-failed` | Server → Client | — | `{ reason }` | Failed session reconnection |
 | `location:sync-ack` | Server → Client | — | `{ count }` | Confirmation of buffered sync |
@@ -795,6 +831,14 @@ interface UserOfflinePayload {
   userId: number;
 }
 
+// user:online
+interface UserOnlinePayload {
+  userId: number;
+  lat: number;
+  lng: number;
+  ts: number;
+}
+
 // session:resumed
 interface SessionResumedPayload {
   roomId: string;
@@ -933,10 +977,17 @@ class ViciSocketService {
       // → Update user marker on map
     });
 
-    // Another user went offline
+    // Another user went offline (fires immediately on disconnect or end-session)
     this.socket.on("user:offline", (data) => {
       console.log("User offline:", data.userId);
-      // → Remove user marker from map
+      // → Remove user marker from map immediately
+    });
+
+    // A previously offline user reconnected
+    this.socket.on("user:online", (data) => {
+      console.log("User back online:", data.userId);
+      // data: { userId, lat, lng, ts }
+      // → Re-add user marker on the map at their last known location
     });
 
     // Session successfully resumed after reconnect
@@ -999,11 +1050,12 @@ async function main() {
 3. **Reconnect Grace Period** — After disconnect, the session stays alive for **48 hours** (configurable via `SESSION_RESUME_WINDOW_MS`). Use `reconnect-session` within this window.
 4. **Session ID** — Must be obtained from your Express/REST backend before starting a session.
 5. **Multi-Device Support** — The same user can connect from multiple devices/sockets. All sockets are tracked per user per room.
-6. **Auto-Cleanup** — If all of a user's sockets disconnect and the grace period expires, `user:offline` is broadcast automatically.
-7. **Silent Validation** — `join-room`, `start-session`, `location:update`, and `end-session` **silently ignore** malformed payloads. Only `reconnect-session` sends error responses.
-8. **Server-Side Timestamps** — The `ts` field in `location:update` broadcasts is set by the server via `Date.now()`, not by the client.
-9. **Redis TLS** — If your `REDIS_URL` starts with `rediss://`, TLS is automatically enabled with `rejectUnauthorized: false`.
-10. **Redis Retry** — The server retries Redis connections up to 10 times with exponential backoff (100ms → 3000ms), and auto-reconnects on `READONLY`, `ECONNRESET`, and `ETIMEDOUT` errors.
+6. **Immediate Offline** — When all of a user's sockets disconnect, `user:offline` is broadcast **immediately** (not after grace period). The session data stays alive for the reconnect window, but other users see them as offline right away.
+7. **Online on Reconnect** — When a disconnected user reconnects within the grace period, `user:online` is broadcast with their last known location.
+8. **Silent Validation** — `join-room`, `start-session`, `location:update`, and `end-session` **silently ignore** malformed payloads. Only `reconnect-session` sends error responses.
+9. **Server-Side Timestamps** — The `ts` field in `location:update` broadcasts is set by the server via `Date.now()`, not by the client.
+10. **Redis TLS** — If your `REDIS_URL` starts with `rediss://`, TLS is automatically enabled with `rejectUnauthorized: false`.
+11. **Redis Retry** — The server retries Redis connections up to 10 times with exponential backoff (100ms → 3000ms), and auto-reconnects on `READONLY`, `ECONNRESET`, and `ETIMEDOUT` errors.
 
 ---
 

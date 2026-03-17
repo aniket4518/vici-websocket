@@ -93,6 +93,8 @@ function detachSocket(socketId: string) {
   if (userData) {
     userData.sockets.delete(socketId);
     if (userData.sockets.size === 0) {
+      // Immediately tell the room this user is offline (marker should be removed)
+      io.to(`room:${active.roomId}`).emit("user:offline", { userId: active.userId });
       scheduleSessionCleanup(active.roomId, active.userId, userData);
     }
   }
@@ -126,7 +128,10 @@ function attachSocketToSession(
   }
 
   const roomMap = getOrCreateRoomMap(roomId);
-  const userData = roomMap.get(userId) ?? {
+  const existing = roomMap.get(userId);
+  const wasDisconnected = existing?.disconnectedAt !== null && existing?.disconnectedAt !== undefined;
+
+  const userData = existing ?? {
     sessionId,
     sockets: new Set<string>(),
     location: null,
@@ -142,6 +147,14 @@ function attachSocketToSession(
 
   socket.join(`room:${roomId}`);
   activeBySocket.set(socket.id, { roomId, userId, sessionId });
+
+  // If user was disconnected/offline and is now reconnecting, tell the room they're back
+  if (wasDisconnected && userData.location) {
+    io.to(`room:${roomId}`).emit("user:online", {
+      userId,
+      ...userData.location,
+    });
+  }
 }
 
 function getActiveUserSession(roomId: string, userId: number) {
@@ -184,6 +197,7 @@ io.on("connection", (socket) => {
     const roomMap = activeUsersByRoom.get(roomId);
     const snapshot = roomMap
       ? Array.from(roomMap.entries())
+        .filter(([, data]) => data.sockets.size > 0 && data.disconnectedAt === null)
         .map(([uid, data]) =>
           data.location ? { userId: uid, ...data.location } : null,
         )
