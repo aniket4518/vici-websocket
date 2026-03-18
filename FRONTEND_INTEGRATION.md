@@ -382,6 +382,54 @@ socket.emit("location:sync-buffered", {
 
 ---
 
+### 7. `session:pause`
+
+Pause the current running session. The user will be treated as **offline** — their marker is removed for other users, and any `location:update` events sent while paused are **silently rejected**. The session stays alive (it is NOT ended), and the socket remains connected.
+
+**Emit:**
+
+```typescript
+socket.emit("session:pause");
+// No payload required
+```
+
+**What happens internally:**
+1. The user's session is flagged as `paused = true`.
+2. A `user:offline` event is broadcast to all users in the room (markers removed).
+3. Any incoming `location:update` events are **silently rejected** while paused.
+4. The user is **excluded from `location:snapshot`** results while paused.
+5. A `session:paused` acknowledgement is sent back to the caller.
+
+**Server Response:** Emits `session:paused` with `{ sessionId }`.
+
+**Error Handling:** Silently ignored if the socket is not in an active session.
+
+---
+
+### 8. `session:resume`
+
+Resume a paused session. The user becomes online again — location updates are accepted, and other users are notified.
+
+**Emit:**
+
+```typescript
+socket.emit("session:resume");
+// No payload required
+```
+
+**What happens internally:**
+1. The user's session is unflagged (`paused = false`).
+2. If the user has a last known location, a `user:online` event is broadcast to the room.
+3. `location:update` events are accepted again.
+4. The user reappears in `location:snapshot` results.
+5. A `session:resumed-active` acknowledgement is sent back to the caller.
+
+**Server Response:** Emits `session:resumed-active` with `{ sessionId }`.
+
+**Error Handling:** Silently ignored if the socket is not in an active session.
+
+---
+
 ## 📥 Server → Client Events
 
 ### 1. `location:snapshot`
@@ -601,12 +649,16 @@ interface SessionResumeFailed {
 | `end-session` | Client → Server | *none* | `user:offline` → room (others) | When user ends running session |
 | `reconnect-session` | Client → Server | `{ roomId, sessionId? }` | `session:resumed` or `session:resume-failed` → caller | After reconnecting, resume a session |
 | `location:sync-buffered` | Client → Server | `{ locations: [{ lat, lng, ts }, ...] }` | `location:sync-ack` → caller | After reconnect, send buffered locations |
-| `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts }, ...]` | Sent after `join-room` (only connected users) |
+| **`session:pause`** | **Client → Server** | ***none*** | **`session:paused` → caller, `user:offline` → room** | **Temporarily stop sharing location** |
+| **`session:resume`** | **Client → Server** | ***none*** | **`session:resumed-active` → caller, `user:online` → room** | **Resume sharing location after pause** |
+| `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts }, ...]` | Sent after `join-room` (only connected & unpaused users) |
 | `location:update` | Server → Client | — | `{ userId, lat, lng, ts }` | Real-time location from other users |
-| `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects or ends session |
-| `user:online` | Server → Client | — | `{ userId, lat, lng, ts }` | When a disconnected user reconnects |
+| `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects, ends session, or **pauses** |
+| `user:online` | Server → Client | — | `{ userId, lat, lng, ts }` | When a disconnected user reconnects or **resumes** |
 | `session:resumed` | Server → Client | — | `{ roomId, sessionId, location, disconnectedAt }` | Successful session reconnection |
 | `session:resume-failed` | Server → Client | — | `{ reason }` | Failed session reconnection |
+| `session:paused` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is paused |
+| `session:resumed-active` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is resumed from pause |
 | `location:sync-ack` | Server → Client | — | `{ count }` | Confirmation of buffered sync |
 
 ---

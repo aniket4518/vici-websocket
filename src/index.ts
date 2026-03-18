@@ -23,6 +23,7 @@ type ActiveUserSession = {
   location: Location | null;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   disconnectedAt: number | null;
+  paused: boolean;
 };
 
 const SESSION_RESUME_WINDOW_MS = Number(
@@ -137,11 +138,13 @@ function attachSocketToSession(
     location: null,
     reconnectTimer: null,
     disconnectedAt: null,
+    paused: false,
   };
 
   clearReconnectTimer(userData);
   userData.sessionId = sessionId;
   userData.disconnectedAt = null;
+  userData.paused = false;
   userData.sockets.add(socket.id);
   roomMap.set(userId, userData);
 
@@ -197,7 +200,7 @@ io.on("connection", (socket) => {
     const roomMap = activeUsersByRoom.get(roomId);
     const snapshot = roomMap
       ? Array.from(roomMap.entries())
-        .filter(([, data]) => data.sockets.size > 0 && data.disconnectedAt === null)
+        .filter(([, data]) => data.sockets.size > 0 && data.disconnectedAt === null && !data.paused)
         .map(([uid, data]) =>
           data.location ? { userId: uid, ...data.location } : null,
         )
@@ -319,6 +322,9 @@ io.on("connection", (socket) => {
     const userData = roomMap.get(active.userId);
     if (!userData) return;
 
+    // Reject location updates while session is paused
+    if (userData.paused) return;
+
     const point: Location = { lat, lng, ts: Date.now() };
     userData.location = point;
 
@@ -338,6 +344,63 @@ io.on("connection", (socket) => {
       userId: active.userId,
       ...point,
     });
+  });
+
+  // ── Pause session: user is treated as offline, location updates are rejected ──
+  socket.on("session:pause", () => {
+    const active = activeBySocket.get(socket.id);
+    if (!active) return;
+
+    const roomMap = activeUsersByRoom.get(active.roomId);
+    if (!roomMap) return;
+
+    const userData = roomMap.get(active.userId);
+    if (!userData) return;
+
+    // Already paused — no-op, but still acknowledge
+    if (userData.paused) {
+      socket.emit("session:paused", { sessionId: active.sessionId });
+      return;
+    }
+
+    userData.paused = true;
+
+    // Broadcast offline to the room so markers are removed
+    io.to(`room:${active.roomId}`).emit("user:offline", { userId: active.userId });
+
+    // Acknowledge back to the user
+    socket.emit("session:paused", { sessionId: active.sessionId });
+  });
+
+  // ── Resume session: user comes back online, location updates are accepted again ──
+  socket.on("session:resume", () => {
+    const active = activeBySocket.get(socket.id);
+    if (!active) return;
+
+    const roomMap = activeUsersByRoom.get(active.roomId);
+    if (!roomMap) return;
+
+    const userData = roomMap.get(active.userId);
+    if (!userData) return;
+
+    // Not paused — no-op, but still acknowledge
+    if (!userData.paused) {
+      socket.emit("session:resumed-active", { sessionId: active.sessionId });
+      return;
+    }
+
+    userData.paused = false;
+
+    // If the user had a last known location, broadcast online immediately
+    if (userData.location) {
+      io.to(`room:${active.roomId}`).emit("user:online", {
+        userId: active.userId,
+        ...userData.location,
+      });
+    }
+
+    // Acknowledge back to the user
+    socket.emit("session:resumed-active", { sessionId: active.sessionId });
   });
 
   socket.on("end-session", () => {
