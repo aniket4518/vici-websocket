@@ -297,14 +297,11 @@ io.on("connection", (socket) => {
       );
 
       await pipeline.exec();
-
-      // Update in-memory state
+ 
       userData.location = lastLocation;
-
-      // Acknowledge to the sender
+ 
       socket.emit("location:sync-ack", { count: newLocations.length });
-
-      // Broadcast the latest position to other users in the room
+ 
       socket.to(`room:${active.roomId}`).emit("location:update", {
         userId: active.userId,
         ...lastLocation,
@@ -321,8 +318,7 @@ io.on("connection", (socket) => {
 
     const userData = roomMap.get(active.userId);
     if (!userData) return;
-
-    // Reject location updates while session is paused
+ 
     if (userData.paused) return;
 
     const point: Location = { lat, lng, ts: Date.now() };
@@ -345,8 +341,7 @@ io.on("connection", (socket) => {
       ...point,
     });
   });
-
-  // ── Pause session: user is treated as offline, location updates are rejected ──
+ 
   socket.on("session:pause", () => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
@@ -371,8 +366,7 @@ io.on("connection", (socket) => {
     // Acknowledge back to the user
     socket.emit("session:paused", { sessionId: active.sessionId });
   });
-
-  // ── Resume session: user comes back online, location updates are accepted again ──
+ 
   socket.on("session:resume", () => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
@@ -408,6 +402,29 @@ io.on("connection", (socket) => {
     if (!active) return;
     finalizeSession(active.roomId, active.userId);
   });
+
+  const handleDiscardSession = async () => {
+    const active = activeBySocket.get(socket.id);
+    if (!active) return;
+
+    try {
+      // Clear all Redis location data for this session and user
+      // If nothing is in Redis for this session, `del` just ignores it and continues.
+      await redis
+        .multi()
+        .del(`session:${active.sessionId}:path`)
+        .del(`session:${active.sessionId}:user:${active.userId}:last-location`)
+        .exec();
+    } catch (error) {
+      console.error("Error deleting session data from Redis:", error);
+    }
+
+    // Remove the user from active tracking and notify others
+    finalizeSession(active.roomId, active.userId);
+  };
+
+  socket.on("discard-session", handleDiscardSession);
+  socket.on("discard-sesion", handleDiscardSession);
 
   socket.on("disconnect", () => {
     detachSocket(socket.id);

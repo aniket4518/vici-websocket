@@ -1,5 +1,27 @@
 # Changelog
 
+## [2026-03-23] — Session Discard Capability
+
+### ✨ New Features
+
+#### `discard-session` (and `discard-sesion`) Event
+
+Users can now completely cancel and delete their session data if they choose. Sending the `"discard-session"` event clears all tracked metrics from the server.
+
+**Emit:**
+
+```typescript
+socket.emit("discard-session"); // Or socket.emit("discard-sesion");
+// No payload required
+```
+
+**What happens internally:**
+1. All Redis path history for the active session (`session:{sessionId}:path`) is immediately **deleted**.
+2. The user's last known location (`session:{sessionId}:user:{userId}:last-location`) is **deleted**.
+3. The session ends essentially mirroring `end-session`, dropping them from the socket trackers and immediately invoking a `user:offline` trigger across the room.
+
+---
+
 ## [2026-03-17] — Fix Ghost Locations & Immediate Offline/Online Events
 
 ### 🐛 Bug Fix

@@ -430,6 +430,26 @@ socket.emit("session:resume");
 
 ---
 
+### 9. `discard-session` (or `discard-sesion`)
+
+Completely discard and delete the current running session's location data from Redis, and end the session. Stops broadcasting your location and removes your data from the server.
+
+**Emit:**
+
+```typescript
+socket.emit("discard-session");
+// No payload required
+```
+
+**What happens internally:**
+1. All location history (`session:{sessionId}:path`) for this session is **deleted** from Redis.
+2. The last known location (`session:{sessionId}:user:{userId}:last-location`) is **deleted** from Redis.
+3. The session is **ended** identically to `end-session` (removed from memory, `user:offline` broadcast to room).
+
+**Error Handling:** Silently ignored if the socket is not in an active session.
+
+---
+
 ## 📥 Server → Client Events
 
 ### 1. `location:snapshot`
@@ -647,6 +667,7 @@ interface SessionResumeFailed {
 | `start-session` | Client → Server | `{ roomId, sessionId }` | — | When user starts a running session |
 | `location:update` | Client → Server | `{ lat, lng }` | `location:update` → room (others) | During active session, share GPS location |
 | `end-session` | Client → Server | *none* | `user:offline` → room (others) | When user ends running session |
+| `discard-session` | Client → Server | *none* | `user:offline` → room (others) | When user wants to cancel and delete their session data entirely |
 | `reconnect-session` | Client → Server | `{ roomId, sessionId? }` | `session:resumed` or `session:resume-failed` → caller | After reconnecting, resume a session |
 | `location:sync-buffered` | Client → Server | `{ locations: [{ lat, lng, ts }, ...] }` | `location:sync-ack` → caller | After reconnect, send buffered locations |
 | **`session:pause`** | **Client → Server** | ***none*** | **`session:paused` → caller, `user:offline` → room** | **Temporarily stop sharing location** |
