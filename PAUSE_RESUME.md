@@ -4,6 +4,8 @@
 
 Allows a user to **temporarily stop sharing their location** without ending the session. While paused, the user appears **offline** to other users (marker removed), and any `location:update` events are silently rejected. On resume, the user goes back **online** and location sharing continues.
 
+> **Note:** In **ghost** or **private** session mode, `user:offline` and `user:online` broadcasts are **suppressed** (they were never sent in the first place), but the paused flag still gates `location:update` acceptance.
+
 ---
 
 ## Why Socket-Only (No HTTP Needed)
@@ -40,7 +42,7 @@ Allows a user to **temporarily stop sharing their location** without ending the 
 ### On Pause (`session:pause`)
 
 1. The user's session is flagged as `paused = true`.
-2. `user:offline` is broadcast to all users in the room → **markers are removed**.
+2. `user:offline` is broadcast to other users in the room → **markers are removed** (suppressed in ghost/private mode, sent via `socket.to()` so the user does not receive their own offline event).
 3. Any incoming `location:update` events from this user are **silently rejected**.
 4. The user is **excluded from `location:snapshot`** results (new joiners won't see them).
 5. `session:paused` acknowledgement is sent back to the caller.
@@ -48,7 +50,7 @@ Allows a user to **temporarily stop sharing their location** without ending the 
 ### On Resume (`session:resume`)
 
 1. The user's session is unflagged (`paused = false`).
-2. If the user has a last known location, `user:online` is broadcast → **marker reappears**.
+2. If the user has a last known location, `user:online` is broadcast to other users → **marker reappears** (suppressed in ghost/private mode, sent via `socket.to()` so the user does not receive their own online event).
 3. `location:update` events are accepted again.
 4. The user reappears in `location:snapshot` results.
 5. `session:resumed-active` acknowledgement is sent back to the caller.
@@ -148,8 +150,8 @@ socket.on("user:online", (data) => {
 - Added `paused: boolean` to `ActiveUserSession` type.
 - `location:update` handler rejects updates when `paused === true`.
 - `location:snapshot` excludes paused users from the snapshot.
-- New `session:pause` handler — sets flag, broadcasts `user:offline`, sends ack.
-- New `session:resume` handler — clears flag, broadcasts `user:online`, sends ack.
+- New `session:pause` handler — sets flag, broadcasts `user:offline` (via `socket.to()`, suppressed in stealth mode), sends ack.
+- New `session:resume` handler — clears flag, broadcasts `user:online` (via `socket.to()`, suppressed in stealth mode), sends ack.
 - `attachSocketToSession` resets `paused = false` on reconnect.
 
 ### `FRONTEND_INTEGRATION.md`

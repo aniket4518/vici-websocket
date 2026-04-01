@@ -1,5 +1,58 @@
 # Changelog
 
+## [2026-04-01] — Ghost & Private Session Modes + Self-Marker Bug Fix
+
+### ✨ New Features
+
+#### Session Modes: Ghost & Private
+
+`start-session` now accepts an optional `sessionMode` field: `"normal"` (default), `"ghost"`, or `"private"`.
+
+In **ghost** or **private** mode, the user is completely invisible to other room members:
+
+- `location:update` is **not** broadcast to the room
+- `user:offline` is **not** broadcast on pause, disconnect, or session end
+- `user:online` is **not** broadcast on resume or reconnect
+- The user is **excluded** from `location:snapshot` results
+- **Data persistence is unchanged** — path and last-location are still saved to Redis normally
+
+**Emit:**
+
+```typescript
+socket.emit("start-session", {
+  roomId: "central-park-runners",
+  sessionId: 12345,
+  sessionMode: "ghost"    // or "private"
+});
+```
+
+Both modes behave identically. The distinction exists for frontend UI/UX purposes.
+
+### 🐛 Bug Fix
+
+#### Self-marker appearing on pause/resume/reconnect
+
+Previously, `session:pause`, `session:resume`, and reconnect logic used `io.to(room)` to broadcast `user:offline` / `user:online` events. Since `io.to()` sends to **all** sockets in the room including the sender, the user received their own events — causing the frontend to display a marker for the user on themselves after resume.
+
+**Fix:** Changed to `socket.to(room)` which excludes the sender socket. The `user:offline` / `user:online` events are now only received by **other** users in the room.
+
+Affected handlers:
+- `session:pause` — `user:offline` no longer sent to self
+- `session:resume` — `user:online` no longer sent to self
+- `attachSocketToSession` (reconnect) — `user:online` no longer sent to self
+
+> Note: `detachSocket` and `finalizeSession` still use `io.to()` — this is correct because the user's socket is already disconnected/removed at that point.
+
+### 📱 Frontend Action Required
+
+1. **Update `start-session` call** — pass `sessionMode` if you want ghost/private mode:
+   ```typescript
+   socket.emit("start-session", { roomId, sessionId, sessionMode: "ghost" });
+   ```
+2. **No changes needed for self-marker fix** — the server now correctly excludes the sender from `user:online` / `user:offline` broadcasts.
+
+---
+
 ## [2026-03-23] — Session Discard Capability
 
 ### ✨ New Features

@@ -17,6 +17,8 @@ type Location = {
   ts: number;
 };
 
+type SessionMode = 'normal' | 'ghost' | 'private';
+
 type ActiveUserSession = {
   sessionId: number;
   sockets: Set<string>;
@@ -24,7 +26,12 @@ type ActiveUserSession = {
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   disconnectedAt: number | null;
   paused: boolean;
+  sessionMode: SessionMode;
 };
+
+function isStealthMode(mode: SessionMode): boolean {
+  return mode === 'ghost' || mode === 'private';
+}
 
 const SESSION_RESUME_WINDOW_MS = Number(
   process.env.SESSION_RESUME_WINDOW_MS ?? 172_800_000, // 48 hours
@@ -35,7 +42,7 @@ const REDIS_TTL_SECONDS = 60 * 60 * 48; // 48 hours
 const activeUsersByRoom = new Map<string, Map<number, ActiveUserSession>>();
 const activeBySocket = new Map<
   string,
-  { roomId: string; userId: number; sessionId: number }
+  { roomId: string; userId: number; sessionId: number; sessionMode: SessionMode }
 >();
 
 function getOrCreateRoomMap(roomId: string) {
@@ -81,7 +88,9 @@ function finalizeSession(roomId: string, userId: number) {
     activeUsersByRoom.delete(roomId);
   }
 
-  io.to(`room:${roomId}`).emit("user:offline", { userId });
+  if (!isStealthMode(userData.sessionMode)) {
+    io.to(`room:${roomId}`).emit("user:offline", { userId });
+  }
 }
 
 function detachSocket(socketId: string) {
@@ -95,7 +104,9 @@ function detachSocket(socketId: string) {
     userData.sockets.delete(socketId);
     if (userData.sockets.size === 0) {
       // Immediately tell the room this user is offline (marker should be removed)
-      io.to(`room:${active.roomId}`).emit("user:offline", { userId: active.userId });
+      if (!isStealthMode(userData.sessionMode)) {
+        io.to(`room:${active.roomId}`).emit("user:offline", { userId: active.userId });
+      }
       scheduleSessionCleanup(active.roomId, active.userId, userData);
     }
   }
@@ -108,6 +119,7 @@ function attachSocketToSession(
   roomId: string,
   userId: number,
   sessionId: number,
+  sessionMode: SessionMode = 'normal',
 ) {
   const previous = activeBySocket.get(socket.id);
   if (previous) {
@@ -139,21 +151,24 @@ function attachSocketToSession(
     reconnectTimer: null,
     disconnectedAt: null,
     paused: false,
+    sessionMode,
   };
 
   clearReconnectTimer(userData);
   userData.sessionId = sessionId;
   userData.disconnectedAt = null;
   userData.paused = false;
+  userData.sessionMode = sessionMode;
   userData.sockets.add(socket.id);
   roomMap.set(userId, userData);
 
   socket.join(`room:${roomId}`);
-  activeBySocket.set(socket.id, { roomId, userId, sessionId });
+  activeBySocket.set(socket.id, { roomId, userId, sessionId, sessionMode });
 
   // If user was disconnected/offline and is now reconnecting, tell the room they're back
-  if (wasDisconnected && userData.location) {
-    io.to(`room:${roomId}`).emit("user:online", {
+  // Use socket.to() to exclude sender (prevents self-marker), skip for stealth modes
+  if (wasDisconnected && userData.location && !isStealthMode(userData.sessionMode)) {
+    socket.to(`room:${roomId}`).emit("user:online", {
       userId,
       ...userData.location,
     });
@@ -200,7 +215,7 @@ io.on("connection", (socket) => {
     const roomMap = activeUsersByRoom.get(roomId);
     const snapshot = roomMap
       ? Array.from(roomMap.entries())
-        .filter(([, data]) => data.sockets.size > 0 && data.disconnectedAt === null && !data.paused)
+        .filter(([, data]) => data.sockets.size > 0 && data.disconnectedAt === null && !data.paused && !isStealthMode(data.sessionMode))
         .map(([uid, data]) =>
           data.location ? { userId: uid, ...data.location } : null,
         )
@@ -210,9 +225,10 @@ io.on("connection", (socket) => {
     socket.emit("location:snapshot", snapshot);
   });
 
-  socket.on("start-session", ({ roomId, sessionId }) => {
+  socket.on("start-session", ({ roomId, sessionId, sessionMode }) => {
     if (!roomId || !sessionId) return;
-    attachSocketToSession(socket, roomId, userId, Number(sessionId));
+    const mode: SessionMode = (sessionMode === 'ghost' || sessionMode === 'private') ? sessionMode : 'normal';
+    attachSocketToSession(socket, roomId, userId, Number(sessionId), mode);
   });
 
   // Frontend reconnect event: verify user is still active in room, then rebind socket and restore location state.
@@ -233,7 +249,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    attachSocketToSession(socket, roomId, userId, userData.sessionId);
+    attachSocketToSession(socket, roomId, userId, userData.sessionId, userData.sessionMode);
 
     if (userData.location) {
       await saveLastLocationToRedis(
@@ -302,10 +318,12 @@ io.on("connection", (socket) => {
  
       socket.emit("location:sync-ack", { count: newLocations.length });
  
-      socket.to(`room:${active.roomId}`).emit("location:update", {
-        userId: active.userId,
-        ...lastLocation,
-      });
+      if (!isStealthMode(active.sessionMode)) {
+        socket.to(`room:${active.roomId}`).emit("location:update", {
+          userId: active.userId,
+          ...lastLocation,
+        });
+      }
     },
   );
 
@@ -336,10 +354,12 @@ io.on("connection", (socket) => {
       )
       .exec();
 
-    socket.to(`room:${active.roomId}`).emit("location:update", {
-      userId: active.userId,
-      ...point,
-    });
+    if (!isStealthMode(active.sessionMode)) {
+      socket.to(`room:${active.roomId}`).emit("location:update", {
+        userId: active.userId,
+        ...point,
+      });
+    }
   });
  
   socket.on("session:pause", () => {
@@ -360,8 +380,11 @@ io.on("connection", (socket) => {
 
     userData.paused = true;
 
-    // Broadcast offline to the room so markers are removed
-    io.to(`room:${active.roomId}`).emit("user:offline", { userId: active.userId });
+    // Broadcast offline to the room so markers are removed (skip for stealth modes)
+    // Use socket.to() to exclude sender (prevents self receiving user:offline)
+    if (!isStealthMode(userData.sessionMode)) {
+      socket.to(`room:${active.roomId}`).emit("user:offline", { userId: active.userId });
+    }
 
     // Acknowledge back to the user
     socket.emit("session:paused", { sessionId: active.sessionId });
@@ -385,9 +408,10 @@ io.on("connection", (socket) => {
 
     userData.paused = false;
 
-    // If the user had a last known location, broadcast online immediately
-    if (userData.location) {
-      io.to(`room:${active.roomId}`).emit("user:online", {
+    // If the user had a last known location, broadcast online immediately (skip for stealth modes)
+    // Use socket.to() to exclude sender (prevents self-marker appearing on resume)
+    if (userData.location && !isStealthMode(userData.sessionMode)) {
+      socket.to(`room:${active.roomId}`).emit("user:online", {
         userId: active.userId,
         ...userData.location,
       });
@@ -407,9 +431,7 @@ io.on("connection", (socket) => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
 
-    try {
-      // Clear all Redis location data for this session and user
-      // If nothing is in Redis for this session, `del` just ignores it and continues.
+    try { 
       await redis
         .multi()
         .del(`session:${active.sessionId}:path`)

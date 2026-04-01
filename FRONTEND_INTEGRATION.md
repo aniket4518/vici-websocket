@@ -219,29 +219,47 @@ Start a running session to begin broadcasting your location to other users in th
 ```typescript
 socket.emit("start-session", {
   roomId: string,
-  sessionId: number
+  sessionId: number,
+  sessionMode?: "normal" | "ghost" | "private"  // Optional, defaults to "normal"
 });
 ```
 
 **Example:**
 
 ```typescript
+// Normal mode (default) — location is shared with the room
 socket.emit("start-session", {
   roomId: "central-park-runners",
-  sessionId: 12345  // Obtained from your Express/REST backend
+  sessionId: 12345
+});
+
+// Ghost mode — location is NOT shared with the room
+socket.emit("start-session", {
+  roomId: "central-park-runners",
+  sessionId: 12345,
+  sessionMode: "ghost"
+});
+
+// Private mode — same behavior as ghost
+socket.emit("start-session", {
+  roomId: "central-park-runners",
+  sessionId: 12345,
+  sessionMode: "private"
 });
 ```
 
-| Parameter   | Type     | Required | Description                                   |
-|-------------|----------|----------|-----------------------------------------------|
-| `roomId`    | `string` | ✅       | Must match the room you joined earlier         |
-| `sessionId` | `number` | ✅       | Session ID obtained from your Express backend  |
+| Parameter     | Type     | Required | Description                                   |
+|---------------|----------|----------|-----------------------------------------------|
+| `roomId`      | `string` | ✅       | Must match the room you joined earlier         |
+| `sessionId`   | `number` | ✅       | Session ID obtained from your Express backend  |
+| `sessionMode` | `string` | ❌       | `"normal"` (default), `"ghost"`, or `"private"`. Ghost and private suppress all room broadcasts. |
 
 **What happens internally:**
 1. If this socket was attached to a different session, it is **detached** from the previous one.
 2. If the user already has an active session in this room (e.g., from another device), the socket is **added** to the existing session's socket set.
 3. Any pending reconnect timer is **cancelled**.
 4. The socket joins the Socket.IO room `room:{roomId}`.
+5. If `sessionMode` is `"ghost"` or `"private"`, the user enters **stealth mode** — see [Session Modes](#-session-modes) below.
 
 **Error Handling:** If `roomId` or `sessionId` is missing, the request is **silently ignored**.
 
@@ -279,7 +297,7 @@ socket.emit("location:update", {
 2. The user's in-memory location is **updated**.
 3. The location point is **appended** to a Redis list: `session:{sessionId}:path`.
 4. The last known location is **stored** in Redis: `session:{sessionId}:user:{userId}:last-location`.
-5. The location (with `userId` and `ts`) is **broadcast** to all other users in the room via `location:update`.
+5. The location (with `userId` and `ts`) is **broadcast** to all other users in the room via `location:update` (skipped in ghost/private mode).
 
 **Error Handling:** Silently ignored if the socket is not in an active session.
 
@@ -300,7 +318,7 @@ socket.emit("end-session");
 1. All sockets belonging to this user's session are **removed** from the room.
 2. The user's session is **deleted** from in-memory state.
 3. If the room becomes empty, it is **cleaned up** from memory.
-4. A `user:offline` event is **broadcast** to remaining room members.
+4. A `user:offline` event is **broadcast** to remaining room members (skipped in ghost/private mode).
 
 **Error Handling:** Silently ignored if the socket is not in an active session.
 
@@ -372,7 +390,7 @@ socket.emit("location:sync-buffered", {
 5. Updates `last-location` key with the **last** point.
 6. Updates in-memory location state.
 7. Emits `location:sync-ack` with `{ count }` — the number of **new** points stored (may be 0 if all were duplicates).
-8. Broadcasts the latest position to the room.
+8. Broadcasts the latest position to the room (skipped in ghost/private mode).
 
 > ⚠️ Buffered points use the **frontend's `ts`** (historical timestamps), unlike `location:update` which uses server-side `Date.now()`.
 
@@ -395,7 +413,7 @@ socket.emit("session:pause");
 
 **What happens internally:**
 1. The user's session is flagged as `paused = true`.
-2. A `user:offline` event is broadcast to all users in the room (markers removed).
+2. A `user:offline` event is broadcast to other users in the room — markers removed (skipped in ghost/private mode).
 3. Any incoming `location:update` events are **silently rejected** while paused.
 4. The user is **excluded from `location:snapshot`** results while paused.
 5. A `session:paused` acknowledgement is sent back to the caller.
@@ -419,9 +437,9 @@ socket.emit("session:resume");
 
 **What happens internally:**
 1. The user's session is unflagged (`paused = false`).
-2. If the user has a last known location, a `user:online` event is broadcast to the room.
+2. If the user has a last known location, a `user:online` event is broadcast to other users in the room (skipped in ghost/private mode).
 3. `location:update` events are accepted again.
-4. The user reappears in `location:snapshot` results.
+4. The user reappears in `location:snapshot` results (except in ghost/private mode).
 5. A `session:resumed-active` acknowledgement is sent back to the caller.
 
 **Server Response:** Emits `session:resumed-active` with `{ sessionId }`.
@@ -444,7 +462,7 @@ socket.emit("discard-session");
 **What happens internally:**
 1. All location history (`session:{sessionId}:path`) for this session is **deleted** from Redis.
 2. The last known location (`session:{sessionId}:user:{userId}:last-location`) is **deleted** from Redis.
-3. The session is **ended** identically to `end-session` (removed from memory, `user:offline` broadcast to room).
+3. The session is **ended** identically to `end-session` (removed from memory, `user:offline` broadcast to room — skipped in ghost/private mode).
 
 **Error Handling:** Silently ignored if the socket is not in an active session.
 
@@ -454,7 +472,7 @@ socket.emit("discard-session");
 
 ### 1. `location:snapshot`
 
-Received **immediately after** emitting `join-room`. Contains only **currently connected** users in the room with their last known location. Users who disconnected (even if within the reconnect window) are **excluded**.
+Received **immediately after** emitting `join-room`. Contains only **currently connected** users in the room with their last known location. Users who disconnected (even if within the reconnect window), paused users, and users in **ghost/private mode** are **excluded**.
 
 **Listen:**
 
@@ -488,6 +506,8 @@ type LocationSnapshot = Array<{
 > 💡 Users who have an active session but haven't sent any location update yet are **excluded** from the snapshot (their `location` is `null`).
 
 > 💡 Users who are disconnected (within the 48h reconnect window but not currently connected) are **excluded** from the snapshot.
+
+> 💡 Users in **ghost** or **private** session mode are **excluded** from the snapshot — they are invisible to other users.
 
 > 💡 If no users are active in the room, an **empty array** `[]` is returned.
 
@@ -526,7 +546,7 @@ interface LocationUpdate {
 
 ### 3. `user:offline`
 
-Received **immediately** when a user's **last socket disconnects** or when a user **ends their session**. The frontend should remove the user's marker from the map right away.
+Received **immediately** when a user's **last socket disconnects** or when a user **ends their session**. The frontend should remove the user's marker from the map right away. **Not sent** for users in ghost/private mode.
 
 > ⚠️ **Changed behavior:** Previously, `user:offline` was only sent after the reconnect grace period expired. Now it is sent **immediately** on disconnect so the frontend does not show stale locations.
 
@@ -556,7 +576,7 @@ interface UserOffline {
 
 ### 4. `user:online`
 
-Received when a user **reconnects** after being offline (their session was in the disconnected/grace period state and they re-attached a socket). The frontend should re-add the user's marker on the map.
+Received when a user **reconnects** after being offline (their session was in the disconnected/grace period state and they re-attached a socket). The frontend should re-add the user's marker on the map. **Not sent** for users in ghost/private mode.
 
 **Listen:**
 
@@ -664,23 +684,25 @@ interface SessionResumeFailed {
 | Event | Direction | Payload (Input) | Response/Broadcast | When to Use |
 |-------|-----------|------------------|--------------------|-------------|
 | `join-room` | Client → Server | `roomId: string` | `location:snapshot` → caller | After connecting, join a tracking room |
-| `start-session` | Client → Server | `{ roomId, sessionId }` | — | When user starts a running session |
-| `location:update` | Client → Server | `{ lat, lng }` | `location:update` → room (others) | During active session, share GPS location |
-| `end-session` | Client → Server | *none* | `user:offline` → room (others) | When user ends running session |
-| `discard-session` | Client → Server | *none* | `user:offline` → room (others) | When user wants to cancel and delete their session data entirely |
+| `start-session` | Client → Server | `{ roomId, sessionId, sessionMode? }` | — | When user starts a running session |
+| `location:update` | Client → Server | `{ lat, lng }` | `location:update` → room (others) ¹ | During active session, share GPS location |
+| `end-session` | Client → Server | *none* | `user:offline` → room (others) ¹ | When user ends running session |
+| `discard-session` | Client → Server | *none* | `user:offline` → room (others) ¹ | When user wants to cancel and delete their session data entirely |
 | `reconnect-session` | Client → Server | `{ roomId, sessionId? }` | `session:resumed` or `session:resume-failed` → caller | After reconnecting, resume a session |
 | `location:sync-buffered` | Client → Server | `{ locations: [{ lat, lng, ts }, ...] }` | `location:sync-ack` → caller | After reconnect, send buffered locations |
-| **`session:pause`** | **Client → Server** | ***none*** | **`session:paused` → caller, `user:offline` → room** | **Temporarily stop sharing location** |
-| **`session:resume`** | **Client → Server** | ***none*** | **`session:resumed-active` → caller, `user:online` → room** | **Resume sharing location after pause** |
-| `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts }, ...]` | Sent after `join-room` (only connected & unpaused users) |
+| **`session:pause`** | **Client → Server** | ***none*** | **`session:paused` → caller, `user:offline` → room** ¹ | **Temporarily stop sharing location** |
+| **`session:resume`** | **Client → Server** | ***none*** | **`session:resumed-active` → caller, `user:online` → room** ¹ | **Resume sharing location after pause** |
+| `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts }, ...]` | Sent after `join-room` (only connected, unpaused, non-stealth users) |
 | `location:update` | Server → Client | — | `{ userId, lat, lng, ts }` | Real-time location from other users |
-| `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects, ends session, or **pauses** |
-| `user:online` | Server → Client | — | `{ userId, lat, lng, ts }` | When a disconnected user reconnects or **resumes** |
+| `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects, ends session, or **pauses** ¹ |
+| `user:online` | Server → Client | — | `{ userId, lat, lng, ts }` | When a disconnected user reconnects or **resumes** ¹ |
 | `session:resumed` | Server → Client | — | `{ roomId, sessionId, location, disconnectedAt }` | Successful session reconnection |
 | `session:resume-failed` | Server → Client | — | `{ reason }` | Failed session reconnection |
 | `session:paused` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is paused |
 | `session:resumed-active` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is resumed from pause |
 | `location:sync-ack` | Server → Client | — | `{ count }` | Confirmation of buffered sync |
+
+> ¹ Room broadcasts are **suppressed** in ghost/private session mode. Data is still saved to Redis.
 
 ---
 
@@ -720,19 +742,23 @@ Map<roomId, Map<userId, ActiveUserSession>>
 ```
 
 ```typescript
+type SessionMode = 'normal' | 'ghost' | 'private';
+
 interface ActiveUserSession {
   sessionId: number;                              // Session ID from backend
   sockets: Set<string>;                           // All connected socket IDs for this user
   location: { lat, lng, ts } | null;              // Last known location
   reconnectTimer: ReturnType<typeof setTimeout> | null;  // Cleanup timer after disconnect
   disconnectedAt: number | null;                  // Timestamp of last disconnect
+  paused: boolean;                                // Whether the session is paused
+  sessionMode: SessionMode;                       // 'normal', 'ghost', or 'private'
 }
 ```
 
 ### `activeBySocket`
 
 ```
-Map<socketId, { roomId, userId, sessionId }>
+Map<socketId, { roomId, userId, sessionId, sessionMode }>
 ```
 
 Quick lookup from a socket ID to its room/user/session context.
@@ -856,9 +882,12 @@ interface JwtPayload {
 type JoinRoomPayload = string;  // roomId
 
 // start-session
+type SessionMode = 'normal' | 'ghost' | 'private';
+
 interface StartSessionPayload {
   roomId: string;
   sessionId: number;
+  sessionMode?: SessionMode;  // Optional — defaults to 'normal'
 }
 
 // location:update (sending)
@@ -984,10 +1013,10 @@ class ViciSocketService {
 
   // ── Session ─────────────────────────────────────────
 
-  startSession(roomId: string, sessionId: number): void {
+  startSession(roomId: string, sessionId: number, sessionMode?: "normal" | "ghost" | "private"): void {
     this.localPath = [];
     this.currentSessionId = sessionId;
-    this.socket?.emit("start-session", { roomId, sessionId });
+    this.socket?.emit("start-session", { roomId, sessionId, sessionMode });
   }
 
   endSession(): void {
@@ -1098,7 +1127,12 @@ async function main() {
   vici.joinRoom("morning-runners");
 
   // 3. When user taps "Start Run"
+  // Normal mode (default)
   vici.startSession("morning-runners", 12345);
+
+  // Or ghost/private mode — location is NOT shared with the room
+  // vici.startSession("morning-runners", 12345, "ghost");
+  // vici.startSession("morning-runners", 12345, "private");
 
   // 4. During the run — send GPS location periodically
   vici.sendLocation(40.785091, -73.968285);
@@ -1129,6 +1163,8 @@ async function main() {
 9. **Server-Side Timestamps** — The `ts` field in `location:update` broadcasts is set by the server via `Date.now()`, not by the client.
 10. **Redis TLS** — If your `REDIS_URL` starts with `rediss://`, TLS is automatically enabled with `rejectUnauthorized: false`.
 11. **Redis Retry** — The server retries Redis connections up to 10 times with exponential backoff (100ms → 3000ms), and auto-reconnects on `READONLY`, `ECONNRESET`, and `ETIMEDOUT` errors.
+12. **Session Modes** — `start-session` accepts an optional `sessionMode`: `"ghost"` or `"private"`. Both suppress **all** room broadcasts (`location:update`, `user:online`, `user:offline`) and exclude the user from `location:snapshot`. Data saving to Redis is **unchanged**.
+13. **No Self-Events** — `user:online` and `user:offline` events from pause/resume/reconnect are sent only to **other** users in the room (via `socket.to()`), not to the user themselves.
 
 ---
 
