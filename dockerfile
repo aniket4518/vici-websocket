@@ -23,10 +23,15 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y dumb-init && rm -rf /var/lib/apt/lists/*
 RUN useradd -m nodejs
 
-# Copy compiled output and production dependencies
-COPY --from=builder /app/node_modules ./node_modules
+# Enable pnpm in runner too
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+# Copy manifest files and install production-only deps (smaller image)
+COPY --from=builder /app/package.json /app/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod
+
+# Copy compiled output
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/package.json ./
 
 ENV NODE_ENV=production
 EXPOSE 3000
