@@ -107,7 +107,7 @@ function finalizeSession(roomId: string, userId: number) {
   }
 }
 
-function detachSocket(socketId: string) {
+async function detachSocket(socketId: string) {
   const active = activeBySocket.get(socketId);
   if (!active) return;
 
@@ -124,9 +124,11 @@ function detachSocket(socketId: string) {
       // Insert a segment break so disconnect→reconnect doesn't draw a false line
       // (skip if already paused — pause handler already inserted a break)
       if (!userData.paused) {
-        pushBreakMarker(userData.sessionId).catch((err) =>
-          console.error("Failed to push break marker on disconnect:", err)
-        );
+        try {
+          await pushBreakMarker(userData.sessionId);
+        } catch (err) {
+          console.error("Failed to push break marker on disconnect:", err);
+        }
       }
       scheduleSessionCleanup(active.roomId, active.userId, userData);
     }
@@ -383,7 +385,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("session:pause", () => {
+  socket.on("session:pause", async () => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
 
@@ -402,9 +404,11 @@ io.on("connection", (socket) => {
     userData.paused = true;
 
     // Insert a segment break so pause→resume doesn't draw a false connecting line
-    pushBreakMarker(active.sessionId).catch((err) =>
-      console.error("Failed to push break marker on pause:", err)
-    );
+    try {
+      await pushBreakMarker(active.sessionId);
+    } catch (err) {
+      console.error("Failed to push break marker on pause:", err);
+    }
 
     // Broadcast offline to the room so markers are removed (skip for stealth modes)
     // Use socket.to() to exclude sender (prevents self receiving user:offline)
