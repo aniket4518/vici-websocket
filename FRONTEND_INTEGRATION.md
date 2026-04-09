@@ -58,6 +58,7 @@ This WebSocket server (built with **Socket.IO**) enables real-time location shar
 | `JWT_SECRET` | ✅ Yes | — | Secret key used to verify JWT tokens |
 | `REDIS_URL` | ❌ No | `localhost:6379` | Redis connection URL (supports `redis://` and `rediss://` for TLS) |
 | `SESSION_RESUME_WINDOW_MS` | ❌ No | `172800000` (48h) | Time (in ms) a disconnected session stays alive before cleanup |
+| `FLUSH_INTERVAL_MS` | ❌ No | `10000` (10s) | How often buffered location points are flushed to Redis (in ms) |
 
 **.env.example:**
 
@@ -293,11 +294,13 @@ socket.emit("location:update", {
 | `lng`     | `number` | ✅       | Longitude coordinate |
 
 **What happens internally:**
-1. A `ts` (Unix timestamp in ms) is **added by the server** via `Date.now()`.
-2. The user's in-memory location is **updated**.
-3. The location point is **appended** to a Redis list: `session:{sessionId}:path`.
-4. The last known location is **stored** in Redis: `session:{sessionId}:user:{userId}:last-location`.
-5. The location (with `userId` and `ts`) is **broadcast** to all other users in the room via `location:update` (skipped in ghost/private mode).
+1. If the location is **identical** to the last known position (same `lat`/`lng`), it is **silently skipped** (consecutive deduplication).
+2. A `ts` (Unix timestamp in ms) is **added by the server** via `Date.now()`.
+3. The user's in-memory location is **updated**.
+4. The location point is **buffered** in memory (flushed to Redis every 10 seconds via `RPUSH` to `session:{sessionId}:path`).
+5. The location (with `userId`, `ts`, and `avatarUrl`) is **broadcast immediately** to all other users in the room via `location:update` (skipped in ghost/private mode).
+
+> 💡 **Buffered writes:** Location points are NOT written to Redis on every update. They are collected in an in-memory buffer and flushed to Redis every 10 seconds (configurable via `FLUSH_INTERVAL_MS`). The buffer is always flushed before `end-session` and on disconnect. Real-time broadcasts to other users are **not affected** — they happen immediately.
 
 **Error Handling:** Silently ignored if the socket is not in an active session.
 
@@ -715,22 +718,20 @@ All location data is persisted in Redis with a **48-hour TTL**.
 
 | Key Pattern | Type | TTL | Description |
 |-------------|------|-----|-------------|
-| `session:{sessionId}:path` | List (`RPUSH`) | 48 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":...}` |
-| `session:{sessionId}:user:{userId}:last-location` | String (`SET`) | 48 hours | The **last known** location for a user in a session. JSON string: `{"lat":..., "lng":..., "ts":...}` |
+| `session:{sessionId}:path` | List (`RPUSH`) | 48 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":...}`. Points are **buffered in memory** and flushed to Redis every 10 seconds. |
 | `user:{userId}:avatar` | String (`SET`) | 48 hours | The user's avatar URL. **Written by the HTTP backend** when a session is created. Read by the WS server once at `start-session` and cached in memory. Explicitly deleted on `discard-session`. |
+
+> 💡 The `session:{sessionId}:user:{userId}:last-location` key has been **removed**. The last known location is now tracked only in memory (`userData.location`). The backend only needs `session:{id}:path` (via `LRANGE`) at session end.
 
 ### Example Redis Entries
 
 ```
-# Path points (list — appended on each location:update)
+# Path points (list — flushed from memory buffer every 10 seconds)
 session:12345:path → [
   '{"lat":40.785091,"lng":-73.968285,"ts":1706636270000}',
   '{"lat":40.785120,"lng":-73.968300,"ts":1706636272000}',
   ...
 ]
-
-# Last known location (string — overwritten on each location:update)
-session:12345:user:42:last-location → '{"lat":40.785120,"lng":-73.968300,"ts":1706636272000}'
 
 # User avatar (string — written by HTTP backend at session creation)
 user:42:avatar → 'https://res.cloudinary.com/xxx/avatars/avatar3.jpg'
@@ -754,12 +755,14 @@ type SessionMode = 'normal' | 'ghost' | 'private';
 interface ActiveUserSession {
   sessionId: number;                              // Session ID from backend
   sockets: Set<string>;                           // All connected socket IDs for this user
-  location: { lat, lng, ts } | null;              // Last known location
+  location: { lat, lng, ts } | null;              // Last known location (in-memory only)
   reconnectTimer: ReturnType<typeof setTimeout> | null;  // Cleanup timer after disconnect
   disconnectedAt: number | null;                  // Timestamp of last disconnect
   paused: boolean;                                // Whether the session is paused
   sessionMode: SessionMode;                       // 'normal', 'ghost', or 'private'
   avatarUrl: string;                              // User's avatar URL (read from Redis at session start)
+  pathBuffer: Location[];                         // Buffered location points (flushed to Redis every 10s)
+  flushTimer: ReturnType<typeof setInterval> | null;  // Periodic flush timer
 }
 ```
 
@@ -1176,6 +1179,9 @@ async function main() {
 11. **Redis Retry** — The server retries Redis connections up to 10 times with exponential backoff (100ms → 3000ms), and auto-reconnects on `READONLY`, `ECONNRESET`, and `ETIMEDOUT` errors.
 12. **Session Modes** — `start-session` accepts an optional `sessionMode`: `"ghost"` or `"private"`. Both suppress **all** room broadcasts (`location:update`, `user:online`, `user:offline`) and exclude the user from `location:snapshot`. Data saving to Redis is **unchanged**.
 13. **No Self-Events** — `user:online` and `user:offline` events from pause/resume/reconnect are sent only to **other** users in the room (via `socket.to()`), not to the user themselves.
+14. **Buffered Path Writes** — Location points are **not** written to Redis on every update. They are buffered in memory and flushed every 10 seconds (configurable via `FLUSH_INTERVAL_MS`). The buffer is flushed on `end-session`, `disconnect`, and session finalization. On `discard-session`, the buffer is **cleared without flushing**.
+15. **Consecutive Deduplication** — If a user sends a `location:update` with the same `lat`/`lng` as their last known position, it is silently skipped. This keeps path and area data clean by eliminating stationary noise.
+16. **No `last-location` Key** — The `session:{id}:user:{id}:last-location` Redis key has been removed. Last known location is tracked only in memory.
 
 ---
 

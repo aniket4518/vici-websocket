@@ -55,6 +55,57 @@ await redis.set(
 
 ---
 
+## [2026-04-09] — Performance Optimizations: Buffered Writes, Dedup & Cleanup
+
+### ⚡ Performance
+
+#### Buffered Path Writes to Redis
+
+Location points are no longer written to Redis on every `location:update`. They are collected in an **in-memory buffer** and flushed to Redis in a single `RPUSH` every **10 seconds** (configurable via `FLUSH_INTERVAL_MS`).
+
+| Metric | Before | After |
+|--------|:------:|:-----:|
+| Redis ops per location update | 4 | 0 (buffered) |
+| Redis ops per 10 seconds | 40 | ~2 (1 RPUSH + 1 EXPIRE) |
+| Redis ops per 1-hour run (1pt/sec) | ~14,400 | ~720 |
+| Max simultaneous runners (100 ops/sec Redis) | ~25 | ~250+ |
+
+**Flush triggers:**
+- Every 10 seconds (periodic timer)
+- On `end-session` (buffer flushed before finalization)
+- On `disconnect` (buffer flushed before entering grace period)
+- On `discard-session` (buffer **cleared without flushing** — data discarded)
+
+**Real-time broadcasts are NOT affected** — `location:update` events to other users still happen immediately.
+
+#### Removed `last-location` Redis Key
+
+The `session:{sessionId}:user:{userId}:last-location` key has been **removed entirely**. Last known location is now tracked only in memory (`userData.location`). The backend only needs `session:{id}:path` via `LRANGE` at session end.
+
+**Savings:** Eliminates 1 `SET` command per location update.
+
+#### Consecutive Location Deduplication
+
+If a user sends `location:update` with the same `lat`/`lng` as their last position, it is **silently skipped**.
+
+Applied to both:
+- `location:update` — single-point check against last position
+- `location:sync-buffered` — consecutive duplicate removal across the entire array
+
+**Benefits:** Cleaner path data, smaller Redis lists, more accurate area/territory calculations.
+
+### ⚙️ New Environment Variable
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FLUSH_INTERVAL_MS` | `10000` (10s) | How often buffered location points are flushed to Redis |
+
+### ⚠️ Breaking Changes
+
+- `session:{sessionId}:user:{userId}:last-location` Redis key no longer exists. If your backend reads this key, switch to reading the last element of `session:{id}:path` instead.
+
+---
+
 ## [2026-04-01] — Ghost & Private Session Modes + Self-Marker Bug Fix
 
 ### ✨ New Features
