@@ -27,6 +27,7 @@ type ActiveUserSession = {
   disconnectedAt: number | null;
   paused: boolean;
   sessionMode: SessionMode;
+  avatarUrl: string;
 };
 
 function isStealthMode(mode: SessionMode): boolean {
@@ -114,7 +115,7 @@ function detachSocket(socketId: string) {
   activeBySocket.delete(socketId);
 }
 
-function attachSocketToSession(
+async function attachSocketToSession(
   socket: Socket,
   roomId: string,
   userId: number,
@@ -144,6 +145,16 @@ function attachSocketToSession(
   const existing = roomMap.get(userId);
   const wasDisconnected = existing?.disconnectedAt !== null && existing?.disconnectedAt !== undefined;
 
+  // Only fetch avatar from Redis when creating a NEW session entry
+  let avatarUrl = existing?.avatarUrl ?? '';
+  if (!existing) {
+    try {
+      avatarUrl = (await redis.get(`user:${userId}:avatar`)) ?? '';
+    } catch (err) {
+      console.error(`[Avatar] Failed to fetch avatar for user ${userId}:`, err);
+    }
+  }
+
   const userData = existing ?? {
     sessionId,
     sockets: new Set<string>(),
@@ -152,6 +163,7 @@ function attachSocketToSession(
     disconnectedAt: null,
     paused: false,
     sessionMode,
+    avatarUrl,
   };
 
   clearReconnectTimer(userData);
@@ -171,6 +183,7 @@ function attachSocketToSession(
     socket.to(`room:${roomId}`).emit("user:online", {
       userId,
       ...userData.location,
+      avatarUrl: userData.avatarUrl,
     });
   }
 }
@@ -217,7 +230,7 @@ io.on("connection", (socket) => {
       ? Array.from(roomMap.entries())
         .filter(([, data]) => data.sockets.size > 0 && data.disconnectedAt === null && !data.paused && !isStealthMode(data.sessionMode))
         .map(([uid, data]) =>
-          data.location ? { userId: uid, ...data.location } : null,
+          data.location ? { userId: uid, ...data.location, avatarUrl: data.avatarUrl } : null,
         )
         .filter(Boolean)
       : [];
@@ -322,6 +335,7 @@ io.on("connection", (socket) => {
         socket.to(`room:${active.roomId}`).emit("location:update", {
           userId: active.userId,
           ...lastLocation,
+          avatarUrl: userData.avatarUrl,
         });
       }
     },
@@ -358,6 +372,7 @@ io.on("connection", (socket) => {
       socket.to(`room:${active.roomId}`).emit("location:update", {
         userId: active.userId,
         ...point,
+        avatarUrl: userData.avatarUrl,
       });
     }
   });
@@ -414,6 +429,7 @@ io.on("connection", (socket) => {
       socket.to(`room:${active.roomId}`).emit("user:online", {
         userId: active.userId,
         ...userData.location,
+        avatarUrl: userData.avatarUrl,
       });
     }
 
@@ -436,6 +452,7 @@ io.on("connection", (socket) => {
         .multi()
         .del(`session:${active.sessionId}:path`)
         .del(`session:${active.sessionId}:user:${active.userId}:last-location`)
+        .del(`user:${active.userId}:avatar`)
         .exec();
     } catch (error) {
       console.error("Error deleting session data from Redis:", error);
