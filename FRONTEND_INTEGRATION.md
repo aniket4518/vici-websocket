@@ -234,14 +234,14 @@ socket.emit("start-session", {
   sessionId: 12345
 });
 
-// Ghost mode — location is NOT shared with the room
+// Ghost mode — Location is NOT broadcast to the room, but the session STILL captures territory
 socket.emit("start-session", {
   roomId: "central-park-runners",
   sessionId: 12345,
   sessionMode: "ghost"
 });
 
-// Private mode — same behavior as ghost
+// Private mode — Location is NOT broadcast to the room, and the session SKIPS territory capture
 socket.emit("start-session", {
   roomId: "central-park-runners",
   sessionId: 12345,
@@ -1145,8 +1145,8 @@ async function main() {
   vici.startSession("morning-runners", 12345);
 
   // Or ghost/private mode — location is NOT shared with the room
-  // vici.startSession("morning-runners", 12345, "ghost");
-  // vici.startSession("morning-runners", 12345, "private");
+  // vici.startSession("morning-runners", 12345, "ghost");   // Still captures territory
+  // vici.startSession("morning-runners", 12345, "private"); // Skips territory capture
 
   // 4. During the run — send GPS location periodically
   vici.sendLocation(40.785091, -73.968285);
@@ -1177,7 +1177,7 @@ async function main() {
 9. **Server-Side Timestamps** — The `ts` field in `location:update` broadcasts is set by the server via `Date.now()`, not by the client.
 10. **Redis TLS** — If your `REDIS_URL` starts with `rediss://`, TLS is automatically enabled with `rejectUnauthorized: false`.
 11. **Redis Retry** — The server retries Redis connections up to 10 times with exponential backoff (100ms → 3000ms), and auto-reconnects on `READONLY`, `ECONNRESET`, and `ETIMEDOUT` errors.
-12. **Session Modes** — `start-session` accepts an optional `sessionMode`: `"ghost"` or `"private"`. Both suppress **all** room broadcasts (`location:update`, `user:online`, `user:offline`) and exclude the user from `location:snapshot`. Data saving to Redis is **unchanged**.
+12. **Session Modes** — `start-session` accepts an optional `sessionMode`: `"ghost"` or `"private"`. Both suppress **all** room broadcasts (`location:update`, `user:online`, `user:offline`) and exclude the user from `location:snapshot`. Data saving to Redis is **unchanged**. Note that the backend completes Ghost sessions with full territory capture, while Private sessions skip territory capture.
 13. **No Self-Events** — `user:online` and `user:offline` events from pause/resume/reconnect are sent only to **other** users in the room (via `socket.to()`), not to the user themselves.
 14. **Buffered Path Writes** — Location points are **not** written to Redis on every update. They are buffered in memory and flushed every 10 seconds (configurable via `FLUSH_INTERVAL_MS`). The buffer is flushed on `end-session`, `disconnect`, and session finalization. On `discard-session`, the buffer is **cleared without flushing**.
 15. **Consecutive Deduplication** — If a user sends a `location:update` with the same `lat`/`lng` as their last known position, it is silently skipped. This keeps path and area data clean by eliminating stationary noise.

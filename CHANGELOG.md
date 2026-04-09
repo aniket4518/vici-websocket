@@ -132,9 +132,9 @@ socket.emit("start-session", {
 });
 ```
 
-Both modes behave identically. The distinction exists for frontend UI/UX purposes.
-
-### 🐛 Bug Fix
+Both modes suppress live socket broadcasts identically, but the backend treats their session endings differently:
+- **Ghost:** The user captures standard territory and area at the end of the session, but is invisible to others live.
+- **Private:** The user calculates their total area but explicitly **skips** territory capture.### 🐛 Bug Fix
 
 #### Self-marker appearing on pause/resume/reconnect
 

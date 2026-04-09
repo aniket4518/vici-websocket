@@ -116,6 +116,20 @@ async function startFlushTimer(sessionId: number, userData: ActiveUserSession) {
   }, FLUSH_INTERVAL_MS);
 }
 
+/**
+ * Insert a segment break marker into the Redis path.
+ * The backend splits the path at these markers to get separate segments,
+ * preventing false straight lines between pause→resume or disconnect→reconnect gaps.
+ */
+async function pushBreakMarker(sessionId: number) {
+  const marker = JSON.stringify({ type: "break", ts: Date.now() });
+  await redis
+    .multi()
+    .rpush(`session:${sessionId}:path`, marker)
+    .expire(`session:${sessionId}:path`, REDIS_TTL_SECONDS)
+    .exec();
+}
+
 function scheduleSessionCleanup(
   roomId: string,
   userId: number,
@@ -165,7 +179,7 @@ function finalizeSession(roomId: string, userId: number) {
   }
 }
 
-function detachSocket(socketId: string) {
+async function detachSocket(socketId: string) {
   const active = activeBySocket.get(socketId);
   if (!active) return;
 
@@ -178,6 +192,15 @@ function detachSocket(socketId: string) {
       // Immediately tell the room this user is offline (marker should be removed)
       if (!isStealthMode(userData.sessionMode)) {
         io.to(`room:${active.roomId}`).emit("user:offline", { userId: active.userId });
+      }
+      // Insert a segment break so disconnect→reconnect doesn't draw a false line
+      // (skip if already paused — pause handler already inserted a break)
+      if (!userData.paused) {
+        try {
+          await pushBreakMarker(userData.sessionId);
+        } catch (err) {
+          console.error("Failed to push break marker on disconnect:", err);
+        }
       }
       scheduleSessionCleanup(active.roomId, active.userId, userData);
     }
@@ -388,9 +411,7 @@ io.on("connection", (socket) => {
         lng: lastPoint.lng,
         ts: lastPoint.ts,
       };
- 
       socket.emit("location:sync-ack", { count: deduped.length });
- 
       if (!isStealthMode(active.sessionMode)) {
         socket.to(`room:${active.roomId}`).emit("location:update", {
           userId: active.userId,
@@ -410,7 +431,7 @@ io.on("connection", (socket) => {
 
     const userData = roomMap.get(active.userId);
     if (!userData) return;
- 
+
     if (userData.paused) return;
 
     // Skip if location is identical to the last known position
@@ -431,8 +452,8 @@ io.on("connection", (socket) => {
       });
     }
   });
- 
-  socket.on("session:pause", () => {
+
+  socket.on("session:pause", async () => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
 
@@ -450,6 +471,13 @@ io.on("connection", (socket) => {
 
     userData.paused = true;
 
+    // Insert a segment break so pause→resume doesn't draw a false connecting line
+    try {
+      await pushBreakMarker(active.sessionId);
+    } catch (err) {
+      console.error("Failed to push break marker on pause:", err);
+    }
+
     // Broadcast offline to the room so markers are removed (skip for stealth modes)
     // Use socket.to() to exclude sender (prevents self receiving user:offline)
     if (!isStealthMode(userData.sessionMode)) {
@@ -459,7 +487,7 @@ io.on("connection", (socket) => {
     // Acknowledge back to the user
     socket.emit("session:paused", { sessionId: active.sessionId });
   });
- 
+
   socket.on("session:resume", () => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
@@ -478,15 +506,9 @@ io.on("connection", (socket) => {
 
     userData.paused = false;
 
-    // If the user had a last known location, broadcast online immediately (skip for stealth modes)
-    // Use socket.to() to exclude sender (prevents self-marker appearing on resume)
-    if (userData.location && !isStealthMode(userData.sessionMode)) {
-      socket.to(`room:${active.roomId}`).emit("user:online", {
-        userId: active.userId,
-        ...userData.location,
-        avatarUrl: userData.avatarUrl,
-      });
-    }
+    // Clear stale pre-pause location — the user may have moved km away.
+    // They will reappear on the map once they send their first fresh location:update.
+    userData.location = null;
 
     // Acknowledge back to the user
     socket.emit("session:resumed-active", { sessionId: active.sessionId });
@@ -519,7 +541,7 @@ io.on("connection", (socket) => {
       clearFlushTimer(userData);
     }
 
-    try { 
+    try {
       await redis
         .multi()
         .del(`session:${active.sessionId}:path`)
