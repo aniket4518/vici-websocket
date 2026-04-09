@@ -28,6 +28,8 @@ type ActiveUserSession = {
   paused: boolean;
   sessionMode: SessionMode;
   avatarUrl: string;
+  pathBuffer: Location[];
+  flushTimer: ReturnType<typeof setInterval> | null;
 };
 
 function isStealthMode(mode: SessionMode): boolean {
@@ -39,6 +41,7 @@ const SESSION_RESUME_WINDOW_MS = Number(
 );
 
 const REDIS_TTL_SECONDS = 60 * 60 * 48; // 48 hours
+const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS ?? 10_000); // 10 seconds
 
 const activeUsersByRoom = new Map<string, Map<number, ActiveUserSession>>();
 const activeBySocket = new Map<
@@ -60,6 +63,59 @@ function clearReconnectTimer(userData: ActiveUserSession) {
   }
 }
 
+function clearFlushTimer(userData: ActiveUserSession) {
+  if (userData.flushTimer) {
+    clearInterval(userData.flushTimer);
+    userData.flushTimer = null;
+  }
+}
+
+/**
+ * Flush the in-memory path buffer to Redis in a single RPUSH.
+ * Called by the flush timer (every 10s), on end-session, and on disconnect.
+ */
+async function flushPathBuffer(sessionId: number, userData: ActiveUserSession) {
+  if (userData.pathBuffer.length === 0) return;
+
+  // Drain the buffer into a local copy so new points can accumulate during the flush
+  const points = userData.pathBuffer.splice(0);
+
+  try {
+    const serialized = points.map((p) => JSON.stringify(p));
+    await redis.rpush(`session:${sessionId}:path`, ...serialized);
+  } catch (err) {
+    console.error(`[Flush] Failed to flush ${points.length} points for session ${sessionId}:`, err);
+    // Put points back at the front of the buffer so they aren't lost
+    userData.pathBuffer.unshift(...points);
+  }
+}
+
+/**
+ * Start the periodic flush timer for a session.
+ * Also sets the Redis key TTL on start (only once, not every flush).
+ */
+async function startFlushTimer(sessionId: number, userData: ActiveUserSession) {
+  if (userData.flushTimer) return; // already running
+
+  // Set TTL once when the timer starts (key may or may not exist yet — EXPIRE is safe either way)
+  try {
+    await redis.expire(`session:${sessionId}:path`, REDIS_TTL_SECONDS);
+  } catch {
+    // Non-critical, TTL will be set on next opportunity
+  }
+
+  userData.flushTimer = setInterval(async () => {
+    await flushPathBuffer(sessionId, userData);
+
+    // Refresh TTL periodically (every flush) to keep the key alive during long sessions
+    try {
+      await redis.expire(`session:${sessionId}:path`, REDIS_TTL_SECONDS);
+    } catch {
+      // Non-critical
+    }
+  }, FLUSH_INTERVAL_MS);
+}
+
 function scheduleSessionCleanup(
   roomId: string,
   userId: number,
@@ -67,6 +123,15 @@ function scheduleSessionCleanup(
 ) {
   clearReconnectTimer(userData);
   userData.disconnectedAt = Date.now();
+
+  // Flush any buffered points before entering grace period
+  flushPathBuffer(userData.sessionId, userData).catch((err) => {
+    console.error(`[Flush] Error flushing on disconnect for user ${userId}:`, err);
+  });
+
+  // Stop the flush timer — no new points will arrive while disconnected
+  clearFlushTimer(userData);
+
   userData.reconnectTimer = setTimeout(() => {
     finalizeSession(roomId, userId);
   }, SESSION_RESUME_WINDOW_MS);
@@ -78,6 +143,12 @@ function finalizeSession(roomId: string, userId: number) {
   if (!roomMap || !userData) return;
 
   clearReconnectTimer(userData);
+  clearFlushTimer(userData);
+
+  // Final flush — ensure any remaining buffered points are written to Redis
+  flushPathBuffer(userData.sessionId, userData).catch((err) => {
+    console.error(`[Flush] Error on finalizeSession for user ${userId}:`, err);
+  });
 
   for (const socketId of userData.sockets) {
     activeBySocket.delete(socketId);
@@ -164,6 +235,8 @@ async function attachSocketToSession(
     paused: false,
     sessionMode,
     avatarUrl,
+    pathBuffer: [],
+    flushTimer: null,
   };
 
   clearReconnectTimer(userData);
@@ -176,6 +249,9 @@ async function attachSocketToSession(
 
   socket.join(`room:${roomId}`);
   activeBySocket.set(socket.id, { roomId, userId, sessionId, sessionMode });
+
+  // Restart the flush timer if it was stopped during disconnect
+  await startFlushTimer(sessionId, userData);
 
   // If user was disconnected/offline and is now reconnecting, tell the room they're back
   // Use socket.to() to exclude sender (prevents self-marker), skip for stealth modes
@@ -190,22 +266,6 @@ async function attachSocketToSession(
 
 function getActiveUserSession(roomId: string, userId: number) {
   return activeUsersByRoom.get(roomId)?.get(userId) ?? null;
-}
-
-async function saveLastLocationToRedis(
-  sessionId: number,
-  userId: number,
-  point: Location,
-) {
-  await redis
-    .multi()
-    .set(
-      `session:${sessionId}:user:${userId}:last-location`,
-      JSON.stringify(point),
-      "EX",
-      REDIS_TTL_SECONDS,
-    )
-    .exec();
 }
 
 const io = new Server(httpServer, {});
@@ -264,14 +324,6 @@ io.on("connection", (socket) => {
 
     attachSocketToSession(socket, roomId, userId, userData.sessionId, userData.sessionMode);
 
-    if (userData.location) {
-      await saveLastLocationToRedis(
-        userData.sessionId,
-        userId,
-        userData.location,
-      );
-    }
-
     socket.emit("session:resumed", {
       roomId,
       sessionId: userData.sessionId,
@@ -303,45 +355,53 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Pipeline all NEW buffered points into Redis in one go
-      const pipeline = redis.multi();
+      // Remove consecutive duplicates (same lat/lng as previous point)
+      const deduped: typeof newLocations = [];
+      let prevLat = userData.location?.lat;
+      let prevLng = userData.location?.lng;
       for (const loc of newLocations) {
+        if (loc.lat !== prevLat || loc.lng !== prevLng) {
+          deduped.push(loc);
+          prevLat = loc.lat;
+          prevLng = loc.lng;
+        }
+      }
+      if (deduped.length === 0) {
+        socket.emit("location:sync-ack", { count: 0 });
+        return;
+      }
+
+      // Sync-buffered writes directly to Redis (already a single batch from the frontend)
+      const pipeline = redis.multi();
+      for (const loc of deduped) {
         const point: Location = { lat: loc.lat, lng: loc.lng, ts: loc.ts };
         pipeline.rpush(`session:${active.sessionId}:path`, JSON.stringify(point));
       }
       pipeline.expire(`session:${active.sessionId}:path`, REDIS_TTL_SECONDS);
 
-      // Update last-location with the final buffered point
-      const lastPoint = locations[locations.length - 1]!;
-      const lastLocation: Location = {
+      await pipeline.exec();
+
+      // Update in-memory last location with the final deduplicated point
+      const lastPoint = deduped[deduped.length - 1]!;
+      userData.location = {
         lat: lastPoint.lat,
         lng: lastPoint.lng,
         ts: lastPoint.ts,
       };
-      pipeline.set(
-        `session:${active.sessionId}:user:${active.userId}:last-location`,
-        JSON.stringify(lastLocation),
-        "EX",
-        REDIS_TTL_SECONDS,
-      );
-
-      await pipeline.exec();
  
-      userData.location = lastLocation;
- 
-      socket.emit("location:sync-ack", { count: newLocations.length });
+      socket.emit("location:sync-ack", { count: deduped.length });
  
       if (!isStealthMode(active.sessionMode)) {
         socket.to(`room:${active.roomId}`).emit("location:update", {
           userId: active.userId,
-          ...lastLocation,
+          ...userData.location,
           avatarUrl: userData.avatarUrl,
         });
       }
     },
   );
 
-  socket.on("location:update", async ({ lat, lng }) => {
+  socket.on("location:update", ({ lat, lng }) => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
 
@@ -353,21 +413,16 @@ io.on("connection", (socket) => {
  
     if (userData.paused) return;
 
+    // Skip if location is identical to the last known position
+    if (userData.location && userData.location.lat === lat && userData.location.lng === lng) return;
+
     const point: Location = { lat, lng, ts: Date.now() };
     userData.location = point;
 
-    await redis
-      .multi()
-      .rpush(`session:${active.sessionId}:path`, JSON.stringify(point))
-      .expire(`session:${active.sessionId}:path`, REDIS_TTL_SECONDS)
-      .set(
-        `session:${active.sessionId}:user:${active.userId}:last-location`,
-        JSON.stringify(point),
-        "EX",
-        REDIS_TTL_SECONDS,
-      )
-      .exec();
+    // Push to in-memory buffer (flushed to Redis every FLUSH_INTERVAL_MS)
+    userData.pathBuffer.push(point);
 
+    // Broadcast to room immediately (real-time markers are unaffected by buffering)
     if (!isStealthMode(active.sessionMode)) {
       socket.to(`room:${active.roomId}`).emit("location:update", {
         userId: active.userId,
@@ -437,9 +492,18 @@ io.on("connection", (socket) => {
     socket.emit("session:resumed-active", { sessionId: active.sessionId });
   });
 
-  socket.on("end-session", () => {
+  socket.on("end-session", async () => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
+
+    // Flush buffered points to Redis before finalizing
+    const roomMap = activeUsersByRoom.get(active.roomId);
+    const userData = roomMap?.get(active.userId);
+    if (userData) {
+      await flushPathBuffer(active.sessionId, userData);
+      clearFlushTimer(userData);
+    }
+
     finalizeSession(active.roomId, active.userId);
   });
 
@@ -447,11 +511,18 @@ io.on("connection", (socket) => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
 
+    // Clear the buffer WITHOUT flushing — data is being thrown away
+    const roomMap = activeUsersByRoom.get(active.roomId);
+    const userData = roomMap?.get(active.userId);
+    if (userData) {
+      userData.pathBuffer.length = 0;
+      clearFlushTimer(userData);
+    }
+
     try { 
       await redis
         .multi()
         .del(`session:${active.sessionId}:path`)
-        .del(`session:${active.sessionId}:user:${active.userId}:last-location`)
         .del(`user:${active.userId}:avatar`)
         .exec();
     } catch (error) {
