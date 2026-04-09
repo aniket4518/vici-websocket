@@ -490,6 +490,7 @@ type LocationSnapshot = Array<{
   lat: number;
   lng: number;
   ts: number;      // Unix timestamp (milliseconds)
+  avatarUrl: string;  // User's avatar URL (from Redis cache)
 }>;
 ```
 
@@ -497,9 +498,9 @@ type LocationSnapshot = Array<{
 
 ```json
 [
-  { "userId": 1, "lat": 40.785091, "lng": -73.968285, "ts": 1706636270000 },
-  { "userId": 2, "lat": 40.782865, "lng": -73.965355, "ts": 1706636268000 },
-  { "userId": 3, "lat": 40.779437, "lng": -73.963244, "ts": 1706636265000 }
+  { "userId": 1, "lat": 40.785091, "lng": -73.968285, "ts": 1706636270000, "avatarUrl": "https://res.cloudinary.com/xxx/avatars/avatar1.jpg" },
+  { "userId": 2, "lat": 40.782865, "lng": -73.965355, "ts": 1706636268000, "avatarUrl": "https://res.cloudinary.com/xxx/avatars/avatar3.jpg" },
+  { "userId": 3, "lat": 40.779437, "lng": -73.963244, "ts": 1706636265000, "avatarUrl": "https://res.cloudinary.com/xxx/avatars/avatar7.jpg" }
 ]
 ```
 
@@ -533,13 +534,14 @@ interface LocationUpdate {
   lat: number;
   lng: number;
   ts: number;       // Unix timestamp (milliseconds), set by the server
+  avatarUrl: string;  // User's avatar URL (from Redis cache)
 }
 ```
 
 **Example Response:**
 
 ```json
-{ "userId": 5, "lat": 40.785091, "lng": -73.968285, "ts": 1706636270000 }
+{ "userId": 5, "lat": 40.785091, "lng": -73.968285, "ts": 1706636270000, "avatarUrl": "https://res.cloudinary.com/xxx/avatars/avatar5.jpg" }
 ```
 
 ---
@@ -594,13 +596,14 @@ interface UserOnline {
   lat: number;
   lng: number;
   ts: number;      // Unix timestamp (milliseconds)
+  avatarUrl: string;  // User's avatar URL (from Redis cache)
 }
 ```
 
 **Example Response:**
 
 ```json
-{ "userId": 5, "lat": 40.785091, "lng": -73.968285, "ts": 1706636290000 }
+{ "userId": 5, "lat": 40.785091, "lng": -73.968285, "ts": 1706636290000, "avatarUrl": "https://res.cloudinary.com/xxx/avatars/avatar5.jpg" }
 ```
 
 ---
@@ -692,10 +695,10 @@ interface SessionResumeFailed {
 | `location:sync-buffered` | Client → Server | `{ locations: [{ lat, lng, ts }, ...] }` | `location:sync-ack` → caller | After reconnect, send buffered locations |
 | **`session:pause`** | **Client → Server** | ***none*** | **`session:paused` → caller, `user:offline` → room** ¹ | **Temporarily stop sharing location** |
 | **`session:resume`** | **Client → Server** | ***none*** | **`session:resumed-active` → caller, `user:online` → room** ¹ | **Resume sharing location after pause** |
-| `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts }, ...]` | Sent after `join-room` (only connected, unpaused, non-stealth users) |
-| `location:update` | Server → Client | — | `{ userId, lat, lng, ts }` | Real-time location from other users |
+| `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts, avatarUrl }, ...]` | Sent after `join-room` (only connected, unpaused, non-stealth users) |
+| `location:update` | Server → Client | — | `{ userId, lat, lng, ts, avatarUrl }` | Real-time location from other users |
 | `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects, ends session, or **pauses** ¹ |
-| `user:online` | Server → Client | — | `{ userId, lat, lng, ts }` | When a disconnected user reconnects or **resumes** ¹ |
+| `user:online` | Server → Client | — | `{ userId, lat, lng, ts, avatarUrl }` | When a disconnected user reconnects or **resumes** ¹ |
 | `session:resumed` | Server → Client | — | `{ roomId, sessionId, location, disconnectedAt }` | Successful session reconnection |
 | `session:resume-failed` | Server → Client | — | `{ reason }` | Failed session reconnection |
 | `session:paused` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is paused |
@@ -714,6 +717,7 @@ All location data is persisted in Redis with a **48-hour TTL**.
 |-------------|------|-----|-------------|
 | `session:{sessionId}:path` | List (`RPUSH`) | 48 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":...}` |
 | `session:{sessionId}:user:{userId}:last-location` | String (`SET`) | 48 hours | The **last known** location for a user in a session. JSON string: `{"lat":..., "lng":..., "ts":...}` |
+| `user:{userId}:avatar` | String (`SET`) | 48 hours | The user's avatar URL. **Written by the HTTP backend** when a session is created. Read by the WS server once at `start-session` and cached in memory. Explicitly deleted on `discard-session`. |
 
 ### Example Redis Entries
 
@@ -727,6 +731,9 @@ session:12345:path → [
 
 # Last known location (string — overwritten on each location:update)
 session:12345:user:42:last-location → '{"lat":40.785120,"lng":-73.968300,"ts":1706636272000}'
+
+# User avatar (string — written by HTTP backend at session creation)
+user:42:avatar → 'https://res.cloudinary.com/xxx/avatars/avatar3.jpg'
 ```
 
 ---
@@ -752,6 +759,7 @@ interface ActiveUserSession {
   disconnectedAt: number | null;                  // Timestamp of last disconnect
   paused: boolean;                                // Whether the session is paused
   sessionMode: SessionMode;                       // 'normal', 'ghost', or 'private'
+  avatarUrl: string;                              // User's avatar URL (read from Redis at session start)
 }
 ```
 
@@ -917,6 +925,7 @@ interface LocationPoint {
 // location:snapshot
 interface UserLocation extends LocationPoint {
   userId: number;
+  avatarUrl: string;
 }
 type LocationSnapshotPayload = UserLocation[];
 
@@ -926,6 +935,7 @@ interface LocationUpdateReceivedPayload {
   lat: number;
   lng: number;
   ts: number;
+  avatarUrl: string;
 }
 
 // user:offline
@@ -939,6 +949,7 @@ interface UserOnlinePayload {
   lat: number;
   lng: number;
   ts: number;
+  avatarUrl: string;
 }
 
 // session:resumed
@@ -1068,15 +1079,15 @@ class ViciSocketService {
     // Snapshot of all active users (after join-room)
     this.socket.on("location:snapshot", (snapshot) => {
       console.log("Active users:", snapshot);
-      // snapshot: [{ userId, lat, lng, ts }, ...]
-      // → Render all users on the map
+      // snapshot: [{ userId, lat, lng, ts, avatarUrl }, ...]
+      // → Render all users on the map with their avatar
     });
 
     // Real-time location from other users
     this.socket.on("location:update", (data) => {
       console.log("User moved:", data);
-      // data: { userId, lat, lng, ts }
-      // → Update user marker on map
+      // data: { userId, lat, lng, ts, avatarUrl }
+      // → Update user marker on map (use avatarUrl for the marker image)
     });
 
     // Another user went offline (fires immediately on disconnect or end-session)
@@ -1088,8 +1099,8 @@ class ViciSocketService {
     // A previously offline user reconnected
     this.socket.on("user:online", (data) => {
       console.log("User back online:", data.userId);
-      // data: { userId, lat, lng, ts }
-      // → Re-add user marker on the map at their last known location
+      // data: { userId, lat, lng, ts, avatarUrl }
+      // → Re-add user marker on the map with their avatar
     });
 
     // Session successfully resumed after reconnect

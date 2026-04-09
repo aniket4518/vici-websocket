@@ -1,5 +1,60 @@
 # Changelog
 
+## [2026-04-09] — User Avatar Support via Redis Cache
+
+### ✨ New Features
+
+#### Avatar URLs in Real-Time Events
+
+All location-related events now include the user's `avatarUrl` field. The avatar URL is cached in Redis by the HTTP backend when a session is created, and read by the WS server once at `start-session`. This allows the frontend to render user avatar markers on the map without any additional API calls.
+
+**Affected events (Server → Client):**
+
+| Event | New field |
+|-------|-----------|
+| `location:snapshot` | `avatarUrl: string` added to each user entry |
+| `location:update` | `avatarUrl: string` added to broadcast payload |
+| `user:online` | `avatarUrl: string` added to reconnect/resume payload |
+
+**How it works:**
+
+1. HTTP backend writes `user:{userId}:avatar` to Redis when creating a session (48h TTL)
+2. WS server reads it once at `start-session` and caches in memory
+3. All outgoing events include `avatarUrl` — zero extra API calls for the frontend
+
+**New Redis key:**
+
+| Key Pattern | Type | TTL | Description |
+|-------------|------|-----|-------------|
+| `user:{userId}:avatar` | String (`SET`) | 48 hours | Written by HTTP backend, read by WS server |
+
+**Cleanup:**
+
+- `discard-session` — explicitly deletes `user:{userId}:avatar` from Redis
+- `end-session` / disconnect — key auto-expires via 48h TTL (backend writes fresh on next session)
+- In-memory avatar data is always cleaned when `finalizeSession` removes the user from the room map
+
+### 📱 Frontend Action Required
+
+1. **Update event handlers** — `location:snapshot`, `location:update`, and `user:online` now include `avatarUrl`. Use it to render the user's avatar on map markers.
+2. **No extra API calls needed** — the avatar URL comes directly with location data.
+3. **Handle empty string** — if `avatarUrl` is `""`, render a default/fallback avatar.
+
+### 🔧 Backend Action Required
+
+Add this to your session-start route (after fetching the user from DB):
+
+```typescript
+await redis.set(
+  `user:${user.id}:avatar`,
+  user.avatarUrl ?? '',
+  'EX',
+  172800  // 48h TTL
+);
+```
+
+---
+
 ## [2026-04-01] — Ghost & Private Session Modes + Self-Marker Bug Fix
 
 ### ✨ New Features
