@@ -130,7 +130,7 @@ async function pushBreakMarker(sessionId: number) {
     .exec();
 }
 
-function scheduleSessionCleanup(
+async function scheduleSessionCleanup(
   roomId: string,
   userId: number,
   userData: ActiveUserSession,
@@ -138,20 +138,22 @@ function scheduleSessionCleanup(
   clearReconnectTimer(userData);
   userData.disconnectedAt = Date.now();
 
-  // Flush any buffered points before entering grace period
-  flushPathBuffer(userData.sessionId, userData).catch((err) => {
-    console.error(`[Flush] Error flushing on disconnect for user ${userId}:`, err);
-  });
-
-  // Stop the flush timer — no new points will arrive while disconnected
+  // Stop the flush timer first — no new timer-driven flushes should fire
   clearFlushTimer(userData);
+
+  // Flush any remaining buffered points before entering grace period
+  try {
+    await flushPathBuffer(userData.sessionId, userData);
+  } catch (err) {
+    console.error(`[Flush] Error flushing on disconnect for user ${userId}:`, err);
+  }
 
   userData.reconnectTimer = setTimeout(() => {
     finalizeSession(roomId, userId);
   }, SESSION_RESUME_WINDOW_MS);
 }
 
-function finalizeSession(roomId: string, userId: number) {
+async function finalizeSession(roomId: string, userId: number) {
   const roomMap = activeUsersByRoom.get(roomId);
   const userData = roomMap?.get(userId);
   if (!roomMap || !userData) return;
@@ -160,9 +162,12 @@ function finalizeSession(roomId: string, userId: number) {
   clearFlushTimer(userData);
 
   // Final flush — ensure any remaining buffered points are written to Redis
-  flushPathBuffer(userData.sessionId, userData).catch((err) => {
+  // Must await so userData is not deleted while a flush is still in-flight
+  try {
+    await flushPathBuffer(userData.sessionId, userData);
+  } catch (err) {
     console.error(`[Flush] Error on finalizeSession for user ${userId}:`, err);
-  });
+  }
 
   for (const socketId of userData.sockets) {
     activeBySocket.delete(socketId);
@@ -197,9 +202,12 @@ async function detachSocket(socketId: string) {
       // (skip if already paused — pause handler already inserted a break)
       if (!userData.paused) {
         try {
+          // Flush buffered points BEFORE the break marker so pre-disconnect
+          // locations don't end up after the break in Redis
+          await flushPathBuffer(userData.sessionId, userData);
           await pushBreakMarker(userData.sessionId);
         } catch (err) {
-          console.error("Failed to push break marker on disconnect:", err);
+          console.error("Failed to flush/push break marker on disconnect:", err);
         }
       }
       scheduleSessionCleanup(active.roomId, active.userId, userData);
@@ -394,6 +402,10 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // Flush any existing buffered points first so we preserve chronological order
+      // (buffered points are older than the sync-buffered batch arriving now)
+      await flushPathBuffer(active.sessionId, userData);
+
       // Sync-buffered writes directly to Redis (already a single batch from the frontend)
       const pipeline = redis.multi();
       for (const loc of deduped) {
@@ -470,6 +482,14 @@ io.on("connection", (socket) => {
     }
 
     userData.paused = true;
+
+    // Flush buffered points BEFORE the break marker so pre-pause
+    // locations don't end up after the break in Redis
+    try {
+      await flushPathBuffer(active.sessionId, userData);
+    } catch (err) {
+      console.error("Failed to flush path buffer on pause:", err);
+    }
 
     // Insert a segment break so pause→resume doesn't draw a false connecting line
     try {
