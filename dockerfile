@@ -27,12 +27,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y dumb-init && rm -rf /var/lib/apt/lists/*
 RUN useradd -m nodejs
 
-# Enable pnpm in runner stage and install production dependencies
+# Enable pnpm in runner too
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
 # Copy manifest files and install production-only deps (smaller image)
 COPY --from=builder /app/package.json /app/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile --prod && pnpm store prune
+RUN pnpm install --frozen-lockfile --prod
 
 # Copy Prisma schema and regenerate client for production
 COPY --from=builder /app/prisma ./prisma
@@ -42,8 +42,6 @@ RUN npx prisma generate
 COPY --from=builder /app/dist ./dist
 
 ENV NODE_ENV=production
-ENV CLERK_SECRET_KEY=""
-ENV DATABASE_URL=""
 EXPOSE 3000
 
 USER nodejs
