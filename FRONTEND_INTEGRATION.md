@@ -29,7 +29,7 @@
 
 This WebSocket server (built with **Socket.IO**) enables real-time location sharing between users during running sessions. Users can:
 
-- **Connect & Join Rooms** — Authenticate via JWT and join a tracking room
+- **Connect & Join Rooms** — Authenticate via Clerk and join a tracking room
 - **View Other Runners** — See all currently active users on a map in real-time
 - **Start Sessions** — Begin a running session to share location with others
 - **Track Their Path** — Location updates are stored both locally (client) and in Redis (server)
@@ -45,7 +45,8 @@ This WebSocket server (built with **Socket.IO**) enables real-time location shar
 | **Node.js** + **TypeScript** | Server runtime & language |
 | **Socket.IO v4** | WebSocket communication |
 | **ioredis** | Redis client for data persistence |
-| **jsonwebtoken** | JWT-based authentication |
+| **@clerk/backend** | Clerk authentication |
+| **@prisma/client** | Database connection for user lookup / sync |
 | **dotenv** | Environment variable management |
 | **Docker** | Containerized deployment |
 
@@ -55,7 +56,8 @@ This WebSocket server (built with **Socket.IO**) enables real-time location shar
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `JWT_SECRET` | ✅ Yes | — | Secret key used to verify JWT tokens |
+| `CLERK_SECRET_KEY` | ✅ Yes | — | Secret key used to verify Clerk tokens |
+| `DATABASE_URL` | ✅ Yes | — | Postgres connection URL for Prisma (used to resolve Clerk `sub` to DB `userId`) |
 | `REDIS_URL` | ❌ No | `localhost:6379` | Redis connection URL (supports `redis://` and `rediss://` for TLS) |
 | `SESSION_RESUME_WINDOW_MS` | ❌ No | `172800000` (48h) | Time (in ms) a disconnected session stays alive before cleanup |
 | `FLUSH_INTERVAL_MS` | ❌ No | `10000` (10s) | How often buffered location points are flushed to Redis (in ms) |
@@ -64,7 +66,8 @@ This WebSocket server (built with **Socket.IO**) enables real-time location shar
 
 ```env
 REDIS_URL=redis://something:password@host:port/db
-JWT_SECRET=your-secret-key
+CLERK_SECRET_KEY=sk_test_xxxxx
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
 SESSION_RESUME_WINDOW_MS=30000
 ```
 
@@ -87,13 +90,13 @@ GET http://YOUR_SERVER_HOST:3000
 
 ### Authentication
 
-The server requires **JWT authentication** during the WebSocket handshake. Provide the token in one of two ways:
+The server requires **Clerk JWT authentication** during the WebSocket handshake. Provide the token in one of two ways:
 
 ```typescript
 // Option 1: Via auth object (recommended)
 const socket = io("ws://YOUR_SERVER_HOST:3000", {
   auth: {
-    token: "your-jwt-token"
+    token: "your-clerk-token"
   }
 });
 
@@ -102,24 +105,16 @@ const socket = io("ws://YOUR_SERVER_HOST:3000", {
   transportOptions: {
     websocket: {
       extraHeaders: {
-        token: "your-jwt-token"
+        token: "your-clerk-token"
       }
     }
   }
 });
 ```
 
-### JWT Token Payload
+### Token Verification and User Sync
 
-The JWT must contain a `userId` field:
-
-```typescript
-interface JwtPayload {
-  userId: number;   // Required — unique user identifier
-  iat?: number;     // Issued-at timestamp
-  exp?: number;     // Expiration timestamp
-}
-```
+The server verifies the token signature using `@clerk/backend`. It extracts the `sub` claim (the Clerk user ID) and does a Prisma database lookup to find the corresponding numeric `userId` used by the legacy application.
 
 ### Connection Errors
 
@@ -134,7 +129,7 @@ socket.on("connect_error", (error) => {
 });
 ```
 
-> ⚠️ If the decoded JWT has no `userId`, the socket is immediately **force-disconnected** after connection.
+> ⚠️ If the token is invalid, or if the Clerk user does not exist in the local database (`USER_NOT_SYNCED`), the socket is immediately **force-disconnected** after connection.
 
 ---
 
@@ -878,13 +873,7 @@ When a user disconnects (network drop, app backgrounded, etc.), the server does 
 // ============ CONNECTION ============
 
 interface SocketAuth {
-  token: string;  // JWT token
-}
-
-interface JwtPayload {
-  userId: number;
-  iat?: number;
-  exp?: number;
+  token: string;  // Clerk JWT token
 }
 
 // ============ CLIENT → SERVER EVENTS ============
@@ -1134,8 +1123,8 @@ class ViciSocketService {
 async function main() {
   const vici = new ViciSocketService();
 
-  // 1. Connect with JWT
-  await vici.connect("your-jwt-token");
+  // 1. Connect with Clerk Token
+  await vici.connect("your-clerk-token");
 
   // 2. Join a room to see other runners
   vici.joinRoom("morning-runners");
@@ -1192,7 +1181,7 @@ async function main() {
 | **Protocol** | WebSocket (Socket.IO v4) |
 | **Default Port** | `3000` |
 | **Bind Address** | `0.0.0.0` (all interfaces) |
-| **Authentication** | JWT via handshake `auth` or `headers` |
+| **Authentication** | Clerk JWT via handshake `auth` or `headers` |
 | **Data Persistence** | Redis (TTL: 48 hours) |
 | **Reconnect Grace Period** | 48 hours (configurable) |
 | **HTTP Health Check** | `GET /` → `200 OK "Socket server is running"` |

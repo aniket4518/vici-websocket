@@ -1,5 +1,42 @@
 # Changelog
 
+## [2026-04-12] — Migration to Clerk Authentication
+
+### ✨ New Features
+
+#### Clerk Auth Integration
+
+The WebSocket server now uses **Clerk** for authentication, replacing the legacy custom JWT implementation.
+
+**Key Changes:**
+- Connection requests now expect a valid Clerk JWT token in the `auth` payload or `headers`.
+- The server validates these tokens using `@clerk/backend`.
+- Instead of extracting a numeric `userId` directly from the token, the server uses the Clerk `sub` (user string ID) to query the database via Prisma and securely resolve the legacy numeric `userId`. This ensures complete compatibility with existing Redis location caching.
+
+### ⚙️ Environment Variables Updated
+
+- **Removed:** `JWT_SECRET` (No longer supported).
+- **Added:** `CLERK_SECRET_KEY` — Required to verify the signatures of incoming Clerk tokens.
+- **Added:** `DATABASE_URL` — Required by Prisma to perform the `clerkId` -> `id` mapping.
+
+### 📱 Frontend Action Required
+
+1. **Update Connection Payloads** — Replace the old custom JWT token with an active Clerk token when initializing the Socket.IO client.
+   ```typescript
+   // Connect with Clerk Token
+   const socket = io("ws://YOUR_SERVER_HOST:3000", {
+     auth: { token: "your-clerk-token" }
+   });
+   ```
+
+### 📦 Dependency Changes
+
+- **Removed:** `jsonwebtoken`
+- **Added:** `@clerk/backend`
+- **Added:** `@prisma/client` and `@prisma/adapter-pg`
+
+---
+
 ## [2026-04-09] — User Avatar Support via Redis Cache
 
 ### ✨ New Features
