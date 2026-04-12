@@ -10,6 +10,10 @@ COPY package.json pnpm-lock.yaml ./
 # Install dependencies
 RUN pnpm install --frozen-lockfile
 
+# Copy Prisma schema and generate client before full copy
+COPY prisma ./prisma
+RUN npx prisma generate
+
 # Copy rest of the project
 COPY . .
 
@@ -29,6 +33,10 @@ RUN corepack enable && corepack prepare pnpm@latest --activate
 # Copy manifest files and install production-only deps (smaller image)
 COPY --from=builder /app/package.json /app/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile --prod
+
+# Copy Prisma schema and regenerate client for production
+COPY --from=builder /app/prisma ./prisma
+RUN npx prisma generate
 
 # Copy compiled output
 COPY --from=builder /app/dist ./dist
