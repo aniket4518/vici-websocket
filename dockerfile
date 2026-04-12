@@ -42,6 +42,8 @@ RUN npx prisma generate
 COPY --from=builder /app/dist ./dist
 
 ENV NODE_ENV=production
+ENV CLERK_SECRET_KEY=""
+ENV DATABASE_URL=""
 EXPOSE 3000
 
 USER nodejs

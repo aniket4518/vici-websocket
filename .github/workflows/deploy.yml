@@ -50,6 +50,7 @@ jobs:
             --name vicisocket-container \
             --restart unless-stopped \
             -p 3000:3000 \
-            -e JWT_SECRET="${{ secrets.JWT_SECRET }}" \
+            -e CLERK_SECRET_KEY="${{ secrets.CLERK_SECRET_KEY }}" \
+            -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
             aniketjha4518/vicisocket:latest
