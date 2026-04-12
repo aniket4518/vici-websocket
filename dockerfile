@@ -27,12 +27,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y dumb-init && rm -rf /var/lib/apt/lists/*
 RUN useradd -m nodejs
 
-# Enable pnpm in runner too
+# Enable pnpm in runner stage and install production dependencies
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
 # Copy manifest files and install production-only deps (smaller image)
 COPY --from=builder /app/package.json /app/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile --prod
+RUN pnpm install --frozen-lockfile --prod && pnpm store prune
 
 # Copy Prisma schema and regenerate client for production
 COPY --from=builder /app/prisma ./prisma

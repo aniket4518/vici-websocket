@@ -38,6 +38,9 @@ jobs:
     needs: build
     runs-on: self-hosted
     steps:
+      - name: Cleanup old docker data
+        run: sudo docker system prune -f
+
       - name: Pull image from docker hub
         run: sudo docker pull aniketjha4518/vicisocket:latest
 
