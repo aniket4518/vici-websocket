@@ -1,5 +1,19 @@
 # Changelog
 
+## [2026-04-13] — Zero-Database WebSocket Authentication
+
+### ⚡ Performance Improvements
+
+#### Optimized Token Handshake
+- The WebSocket server no longer queries the database via Prisma on every new connection to lookup the user.
+- The server now extracts the legacy numeric `userId` directly from a **custom claim** (`userId`) configured inside the Clerk session token payload.
+- This entirely eliminates the database dependency during the authentication stage, directly improving connection handshake latency and reducing load.
+
+### ⚙️ Environment Variables Updated
+- **Removed:** `DATABASE_URL` is no longer required for WebSocket authentication.
+
+---
+
 ## [2026-04-12] — Migration to Clerk Authentication
 
 ### ✨ New Features

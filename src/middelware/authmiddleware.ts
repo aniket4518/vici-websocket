@@ -1,6 +1,6 @@
 import { verifyToken } from "@clerk/backend";
 import type { Socket } from "socket.io";
-import { prisma } from "../config/prisma";
+
 
 export default async function socketAuth(
   socket: Socket,
@@ -18,18 +18,17 @@ export default async function socketAuth(
       secretKey: process.env.CLERK_SECRET_KEY!,
     });
 
-    // Look up local user by Clerk's user ID (the `sub` claim) to get numeric DB id
-    const user = await prisma.user.findUnique({
-      where: { clerkId: clerkPayload.sub },
-      select: { id: true },
-    });
+    // Extract the custom claim we configured in the Clerk Dashboard
+    const numericUserId = (clerkPayload as any).userId;
 
-    if (!user) {
+    // Optional: Also check standard `clerkPayload.sub` if somehow it's missing, but here
+    // we strictly rely on the custom claim to avoid DB lookup.
+    if (!numericUserId) {
+      console.warn(`Missing 'userId' custom claim in Clerk token for sub: ${clerkPayload.sub}`);
       return next(new Error("USER_NOT_SYNCED"));
     }
 
-    // Preserve the same contract — socket.data.user.id is a number
-    socket.data.user = { id: user.id };
+    socket.data.user = { id: Number(numericUserId) };
     next();
   } catch (err) {
     console.error("Socket auth error:", err);

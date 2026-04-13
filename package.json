@@ -15,17 +15,13 @@
   "packageManager": "pnpm@10.28.1",
   "dependencies": {
     "@clerk/backend": "^3.2.8",
-    "@prisma/adapter-pg": "^7.7.0",
-    "@prisma/client": "^7.7.0",
     "dotenv": "^17.2.3",
     "ioredis": "^5.9.2",
-    "pg": "^8.20.0",
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
     "@types/node": "^25.0.10",
-    "prisma": "^7.7.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }

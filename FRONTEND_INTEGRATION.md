@@ -57,7 +57,7 @@ This WebSocket server (built with **Socket.IO**) enables real-time location shar
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `CLERK_SECRET_KEY` | ✅ Yes | — | Secret key used to verify Clerk tokens |
-| `DATABASE_URL` | ✅ Yes | — | Postgres connection URL for Prisma (used to resolve Clerk `sub` to DB `userId`) |
+| `DATABASE_URL` | ❌ No | — | Legacy Postgres connection URL (no longer required for WebSocket authentication) |
 | `REDIS_URL` | ❌ No | `localhost:6379` | Redis connection URL (supports `redis://` and `rediss://` for TLS) |
 | `SESSION_RESUME_WINDOW_MS` | ❌ No | `172800000` (48h) | Time (in ms) a disconnected session stays alive before cleanup |
 | `FLUSH_INTERVAL_MS` | ❌ No | `10000` (10s) | How often buffered location points are flushed to Redis (in ms) |
@@ -114,7 +114,7 @@ const socket = io("ws://YOUR_SERVER_HOST:3000", {
 
 ### Token Verification and User Sync
 
-The server verifies the token signature using `@clerk/backend`. It extracts the `sub` claim (the Clerk user ID) and does a Prisma database lookup to find the corresponding numeric `userId` used by the legacy application.
+The server verifies the token signature using `@clerk/backend`. It directly extracts the legacy DB numeric `userId` from a **custom claim configured in the Clerk dashboard's session token**. This eliminates the need for any slow database lookups during the handshake protocol.
 
 ### Connection Errors
 
