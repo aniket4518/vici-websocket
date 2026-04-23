@@ -578,6 +578,24 @@ io.on("connection", (socket) => {
   socket.on("discard-session", handleDiscardSession);
   socket.on("discard-sesion", handleDiscardSession);
 
+  socket.on("user:hype", ({ targetUserId }: { targetUserId: number }) => {
+    const active = activeBySocket.get(socket.id);
+    if (!active) return;
+
+    if (!isStealthMode(active.sessionMode)) {
+      const roomMap = activeUsersByRoom.get(active.roomId);
+      const targetUser = roomMap?.get(targetUserId);
+
+      // Only allow if target is actively in the room and in normal mode
+      if (targetUser && !isStealthMode(targetUser.sessionMode)) {
+        socket.to(`room:${active.roomId}`).emit("user:hype", {
+          senderId: active.userId,
+          targetUserId,
+        });
+      }
+    }
+  });
+
   socket.on("disconnect", () => {
     detachSocket(socket.id);
   });

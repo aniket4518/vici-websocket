@@ -2,7 +2,7 @@
 
 ## [2026-04-13] — Zero-Database WebSocket Authentication
 
-### ⚡ Performance Improvements
+###  Performance Improvements
 
 #### Optimized Token Handshake
 - The WebSocket server no longer queries the database via Prisma on every new connection to lookup the user.

@@ -466,6 +466,36 @@ socket.emit("discard-session");
 
 ---
 
+### 10. `user:hype`
+
+Send a "hype" (highfive) to a specific user in the room.
+
+**Emit:**
+
+```typescript
+socket.emit("user:hype", { targetUserId: number });
+```
+
+**Example:**
+
+```typescript
+socket.emit("user:hype", { targetUserId: 5 });
+```
+
+| Parameter      | Type     | Required | Description                     |
+|----------------|----------|----------|---------------------------------|
+| `targetUserId` | `number` | ✅       | The user ID to send the hype to |
+
+**What happens internally:**
+1. The server verifies the sender has an active session.
+2. The server verifies the target user is active in the room and is not in ghost/private mode.
+3. The server broadcasts a `user:hype` event to the room containing the `senderId` and `targetUserId`.
+4. Skipped if the sender or target is in ghost/private mode.
+
+**Error Handling:** Silently ignored if the socket is not in an active session.
+
+---
+
 ## 📥 Server → Client Events
 
 ### 1. `location:snapshot`
@@ -680,6 +710,35 @@ interface SessionResumeFailed {
 
 ---
 
+### 7. `user:hype`
+
+Received when a user sends a "hype" (highfive) to someone in the room. This is broadcast to the room so the frontend can display an animation or message.
+
+**Listen:**
+
+```typescript
+socket.on("user:hype", (data) => {
+  // Check if the current user is the target, or just show an animation between sender and target
+});
+```
+
+**Payload:**
+
+```typescript
+interface UserHype {
+  senderId: number;     // The user who sent the hype
+  targetUserId: number; // The user who received the hype
+}
+```
+
+**Example Response:**
+
+```json
+{ "senderId": 2, "targetUserId": 5 }
+```
+
+---
+
 ## 🗺️ Events Summary Table
 
 | Event | Direction | Payload (Input) | Response/Broadcast | When to Use |
@@ -691,6 +750,7 @@ interface SessionResumeFailed {
 | `discard-session` | Client → Server | *none* | `user:offline` → room (others) ¹ | When user wants to cancel and delete their session data entirely |
 | `reconnect-session` | Client → Server | `{ roomId, sessionId? }` | `session:resumed` or `session:resume-failed` → caller | After reconnecting, resume a session |
 | `location:sync-buffered` | Client → Server | `{ locations: [{ lat, lng, ts }, ...] }` | `location:sync-ack` → caller | After reconnect, send buffered locations |
+| `user:hype` | Client → Server | `{ targetUserId }` | `user:hype` → room (others) ¹ | Send a highfive/hype to a user |
 | **`session:pause`** | **Client → Server** | ***none*** | **`session:paused` → caller, `user:offline` → room** ¹ | **Temporarily stop sharing location** |
 | **`session:resume`** | **Client → Server** | ***none*** | **`session:resumed-active` → caller, `user:online` → room** ¹ | **Resume sharing location after pause** |
 | `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts, avatarUrl }, ...]` | Sent after `join-room` (only connected, unpaused, non-stealth users) |
@@ -702,6 +762,7 @@ interface SessionResumeFailed {
 | `session:paused` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is paused |
 | `session:resumed-active` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is resumed from pause |
 | `location:sync-ack` | Server → Client | — | `{ count }` | Confirmation of buffered sync |
+| `user:hype` | Server → Client | — | `{ senderId, targetUserId }` | A user sent a hype to someone |
 
 > ¹ Room broadcasts are **suppressed** in ghost/private session mode. Data is still saved to Redis.
 
