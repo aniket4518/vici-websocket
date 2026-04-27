@@ -270,16 +270,25 @@ Send your current GPS location. **Only works after `start-session`** — if no a
 ```typescript
 socket.emit("location:update", {
   lat: number,
-  lng: number
+  lng: number,
+  minute?: number   // Active-minute counter (1, 2, 3 …) — only increments while running
 });
 ```
 
 **Example:**
 
 ```typescript
+// Basic location update (no speed tracking)
 socket.emit("location:update", {
   lat: 40.785091,
   lng: -73.968285
+});
+
+// Location update with active-minute marker (for per-minute speed analysis)
+socket.emit("location:update", {
+  lat: 40.785091,
+  lng: -73.968285,
+  minute: 3   // 3rd active minute of the session
 });
 ```
 
@@ -287,15 +296,19 @@ socket.emit("location:update", {
 |-----------|----------|----------|----------------------|
 | `lat`     | `number` | ✅       | Latitude coordinate  |
 | `lng`     | `number` | ✅       | Longitude coordinate |
+| `minute`  | `number` | ❌       | Active-minute counter sent by the frontend. Only increments while the session is actively running — pauses and disconnections should **not** increment this counter. Used by the backend to compute per-minute average speed. |
 
 **What happens internally:**
 1. If the location is **identical** to the last known position (same `lat`/`lng`), it is **silently skipped** (consecutive deduplication).
 2. A `ts` (Unix timestamp in ms) is **added by the server** via `Date.now()`.
-3. The user's in-memory location is **updated**.
-4. The location point is **buffered** in memory (flushed to Redis every 10 seconds via `RPUSH` to `session:{sessionId}:path`).
-5. The location (with `userId`, `ts`, and `avatarUrl`) is **broadcast immediately** to all other users in the room via `location:update` (skipped in ghost/private mode).
+3. If `minute` is provided, it is **included** in the stored data point.
+4. The user's in-memory location is **updated**.
+5. The location point is **buffered** in memory (flushed to Redis every 10 seconds via `RPUSH` to `session:{sessionId}:path`).
+6. The location (with `userId`, `ts`, and `avatarUrl`) is **broadcast immediately** to all other users in the room via `location:update` (skipped in ghost/private mode).
 
 > 💡 **Buffered writes:** Location points are NOT written to Redis on every update. They are collected in an in-memory buffer and flushed to Redis every 10 seconds (configurable via `FLUSH_INTERVAL_MS`). The buffer is always flushed before `end-session` and on disconnect. Real-time broadcasts to other users are **not affected** — they happen immediately.
+
+> 💡 **Active-minute tracking:** The `minute` field enables per-minute speed analysis on the backend. The frontend should maintain a counter that starts at `1` when the session begins, increments by `1` every 60 seconds of **active running time**, and **freezes** during pauses. This way, gaps in the minute sequence naturally represent paused/disconnected periods — no extra logic needed.
 
 **Error Handling:** Silently ignored if the socket is not in an active session.
 
@@ -745,7 +758,7 @@ interface UserHype {
 |-------|-----------|------------------|--------------------|-------------|
 | `join-room` | Client → Server | `roomId: string` | `location:snapshot` → caller | After connecting, join a tracking room |
 | `start-session` | Client → Server | `{ roomId, sessionId, sessionMode? }` | — | When user starts a running session |
-| `location:update` | Client → Server | `{ lat, lng }` | `location:update` → room (others) ¹ | During active session, share GPS location |
+| `location:update` | Client → Server | `{ lat, lng, minute? }` | `location:update` → room (others) ¹ | During active session, share GPS location |
 | `end-session` | Client → Server | *none* | `user:offline` → room (others) ¹ | When user ends running session |
 | `discard-session` | Client → Server | *none* | `user:offline` → room (others) ¹ | When user wants to cancel and delete their session data entirely |
 | `reconnect-session` | Client → Server | `{ roomId, sessionId? }` | `session:resumed` or `session:resume-failed` → caller | After reconnecting, resume a session |
@@ -774,7 +787,7 @@ All location data is persisted in Redis with a **48-hour TTL**.
 
 | Key Pattern | Type | TTL | Description |
 |-------------|------|-----|-------------|
-| `session:{sessionId}:path` | List (`RPUSH`) | 48 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":...}`. Points are **buffered in memory** and flushed to Redis every 10 seconds. |
+| `session:{sessionId}:path` | List (`RPUSH`) | 48 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":..., "minute":...}` (the `minute` field is present only if the frontend sends it). Points are **buffered in memory** and flushed to Redis every 10 seconds. |
 | `user:{userId}:avatar` | String (`SET`) | 48 hours | The user's avatar URL. **Written by the HTTP backend** when a session is created. Read by the WS server once at `start-session` and cached in memory. Explicitly deleted on `discard-session`. |
 
 > 💡 The `session:{sessionId}:user:{userId}:last-location` key has been **removed**. The last known location is now tracked only in memory (`userData.location`). The backend only needs `session:{id}:path` (via `LRANGE`) at session end.
@@ -784,8 +797,9 @@ All location data is persisted in Redis with a **48-hour TTL**.
 ```
 # Path points (list — flushed from memory buffer every 10 seconds)
 session:12345:path → [
-  '{"lat":40.785091,"lng":-73.968285,"ts":1706636270000}',
-  '{"lat":40.785120,"lng":-73.968300,"ts":1706636272000}',
+  '{"lat":40.785091,"lng":-73.968285,"ts":1706636270000,"minute":1}',
+  '{"lat":40.785120,"lng":-73.968300,"ts":1706636272000,"minute":1}',
+  '{"lat":40.785200,"lng":-73.968400,"ts":1706636332000,"minute":2}',
   ...
 ]
 
@@ -811,7 +825,7 @@ type SessionMode = 'normal' | 'ghost' | 'private';
 interface ActiveUserSession {
   sessionId: number;                              // Session ID from backend
   sockets: Set<string>;                           // All connected socket IDs for this user
-  location: { lat, lng, ts } | null;              // Last known location (in-memory only)
+  location: { lat, lng, ts, minute? } | null;     // Last known location (in-memory only)
   reconnectTimer: ReturnType<typeof setTimeout> | null;  // Cleanup timer after disconnect
   disconnectedAt: number | null;                  // Timestamp of last disconnect
   paused: boolean;                                // Whether the session is paused
@@ -955,6 +969,7 @@ interface StartSessionPayload {
 interface LocationUpdatePayload {
   lat: number;
   lng: number;
+  minute?: number;  // Active-minute counter (1, 2, 3 …) — only increments while running, freezes on pause
 }
 
 // end-session
@@ -972,7 +987,8 @@ interface ReconnectSessionPayload {
 interface LocationPoint {
   lat: number;
   lng: number;
-  ts: number;  // Unix timestamp in milliseconds
+  ts: number;      // Unix timestamp in milliseconds
+  minute?: number; // Active-minute counter (present if sent by frontend)
 }
 
 // location:snapshot
@@ -1080,20 +1096,50 @@ class ViciSocketService {
   startSession(roomId: string, sessionId: number, sessionMode?: "normal" | "ghost" | "private"): void {
     this.localPath = [];
     this.currentSessionId = sessionId;
+    this.activeMinute = 1;
     this.socket?.emit("start-session", { roomId, sessionId, sessionMode });
+
+    // Start the active-minute timer — increments every 60s while running
+    this.minuteTimer = setInterval(() => {
+      this.activeMinute++;
+    }, 60_000);
   }
 
   endSession(): void {
     this.socket?.emit("end-session");
     this.currentSessionId = null;
+    if (this.minuteTimer) {
+      clearInterval(this.minuteTimer);
+      this.minuteTimer = null;
+    }
+  }
+
+  pauseSession(): void {
+    this.socket?.emit("session:pause");
+    // Freeze the minute counter — paused time should NOT increment it
+    if (this.minuteTimer) {
+      clearInterval(this.minuteTimer);
+      this.minuteTimer = null;
+    }
+  }
+
+  resumeSession(): void {
+    this.socket?.emit("session:resume");
+    // Resume the minute counter
+    this.minuteTimer = setInterval(() => {
+      this.activeMinute++;
+    }, 60_000);
   }
 
   // ── Location ────────────────────────────────────────
 
+  private activeMinute = 0;
+  private minuteTimer: ReturnType<typeof setInterval> | null = null;
+
   sendLocation(lat: number, lng: number): void {
-    const point = { lat, lng, ts: Date.now() };
+    const point = { lat, lng, ts: Date.now(), minute: this.activeMinute };
     this.localPath.push(point);               // Store locally for path rendering
-    this.socket?.emit("location:update", { lat, lng });
+    this.socket?.emit("location:update", { lat, lng, minute: this.activeMinute });
   }
 
   getLocalPath() {
@@ -1232,6 +1278,7 @@ async function main() {
 14. **Buffered Path Writes** — Location points are **not** written to Redis on every update. They are buffered in memory and flushed every 10 seconds (configurable via `FLUSH_INTERVAL_MS`). The buffer is flushed on `end-session`, `disconnect`, and session finalization. On `discard-session`, the buffer is **cleared without flushing**.
 15. **Consecutive Deduplication** — If a user sends a `location:update` with the same `lat`/`lng` as their last known position, it is silently skipped. This keeps path and area data clean by eliminating stationary noise.
 16. **No `last-location` Key** — The `session:{id}:user:{id}:last-location` Redis key has been removed. Last known location is tracked only in memory.
+17. **Active-Minute Counter** — The optional `minute` field in `location:update` enables per-minute speed analysis. The frontend should maintain a simple counter that starts at `1`, increments every 60 seconds of active running, and **freezes** during pauses. The backend groups path points by this counter and computes average speed per minute. Gaps in the minute sequence naturally indicate paused/disconnected periods.
 
 ---
 

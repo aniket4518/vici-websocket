@@ -15,6 +15,8 @@ type Location = {
   lat: number;
   lng: number;
   ts: number;
+  /** Active-minute counter sent by the frontend (1, 2, 3 …). Only increments while running — pauses don't count. */
+  minute?: number;
 };
 
 type SessionMode = 'normal' | 'ghost' | 'private';
@@ -434,7 +436,7 @@ io.on("connection", (socket) => {
     },
   );
 
-  socket.on("location:update", ({ lat, lng }) => {
+  socket.on("location:update", ({ lat, lng, minute }: { lat: number; lng: number; minute?: number }) => {
     const active = activeBySocket.get(socket.id);
     if (!active) return;
 
@@ -450,6 +452,8 @@ io.on("connection", (socket) => {
     if (userData.location && userData.location.lat === lat && userData.location.lng === lng) return;
 
     const point: Location = { lat, lng, ts: Date.now() };
+    if (minute != null) point.minute = minute;
+
     userData.location = point;
 
     // Push to in-memory buffer (flushed to Redis every FLUSH_INTERVAL_MS)
@@ -595,6 +599,7 @@ io.on("connection", (socket) => {
       }
     }
   });
+
 
   socket.on("disconnect", () => {
     detachSocket(socket.id);
